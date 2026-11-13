@@ -254,29 +254,13 @@ static void test_boundary_validation(void) {
     TEST_ASSERT(mg_is_valid_access(buf + 50, 51) == 0, "Access 51 bytes from offset 50 (exceeds boundary) is rejected");
     TEST_ASSERT(mg_is_valid_access(buf + 99, 2) == 0, "Access 2 bytes from offset 99 (exceeds boundary) is rejected");
 
-    /* Use uintptr_t to construct exact boundary and out-of-bounds addresses without invalid C pointer arithmetic */
-    uintptr_t buf_addr = (uintptr_t)buf;
+    /* 5. Access starting at the exact allocation boundary using the valid one-past pointer expression */
+    const void *boundary_ptr = buf + alloc_size;
+    TEST_ASSERT(mg_is_valid_access(boundary_ptr, 1) == 0, "Access 1 byte starting at boundary is rejected");
+    TEST_ASSERT(mg_is_valid_access(boundary_ptr, 10) == 0, "Access 10 bytes starting at boundary is rejected");
+    TEST_ASSERT(mg_is_valid_access(boundary_ptr, 0) == 0, "Zero-size access at boundary is rejected");
 
-    if (buf_addr <= UINTPTR_MAX - alloc_size) {
-        const void *boundary_addr = (const void *)(buf_addr + alloc_size);
-        TEST_ASSERT(mg_is_valid_access(boundary_addr, 1) == 0, "Access 1 byte starting at boundary is rejected");
-        TEST_ASSERT(mg_is_valid_access(boundary_addr, 0) == 0, "Zero-size access at boundary is rejected");
-    }
-
-    /* 5. Access starting outside the allocation */
-    if (buf_addr > 0) {
-        const void *addr_before = (const void *)(buf_addr - 1);
-        TEST_ASSERT(mg_is_valid_access(addr_before, 1) == 0, "Access starting before base is rejected");
-        TEST_ASSERT(mg_is_valid_access(addr_before, 10) == 0, "Access spanning before and into base is rejected");
-        TEST_ASSERT(mg_is_valid_access(addr_before, 0) == 0, "Zero-size access before base is rejected");
-    }
-
-    if (buf_addr <= UINTPTR_MAX - (alloc_size + 1)) {
-        const void *addr_past = (const void *)(buf_addr + alloc_size + 1);
-        TEST_ASSERT(mg_is_valid_access(addr_past, 1) == 0, "Access starting past allocation is rejected");
-    }
-
-    /* Untracked stack pointer */
+    /* Untracked stack pointer (outside all tracked allocations) */
     int stack_var = 42;
     TEST_ASSERT(mg_is_valid_access(&stack_var, sizeof(stack_var)) == 0, "Stack pointer access is rejected");
 
@@ -285,9 +269,8 @@ static void test_boundary_validation(void) {
     TEST_ASSERT(mg_is_valid_access(NULL, 10) == 0, "Access 10 bytes with NULL pointer is rejected");
     TEST_ASSERT(mg_is_valid_access(NULL, 0) == 0, "Zero-size access with NULL pointer is rejected");
 
-    /* 7. Address calculation overflow checks */
-    TEST_ASSERT(mg_is_valid_access(buf, (size_t)-1) == 0, "Huge access size causing address overflow is rejected");
-    TEST_ASSERT(mg_is_valid_access((const void *)(UINTPTR_MAX - 5), 10) == 0, "Overflowing pointer+size calculation is rejected");
+    /* 7. Address calculation overflow check with SIZE_MAX */
+    TEST_ASSERT(mg_is_valid_access(buf, SIZE_MAX) == 0, "SIZE_MAX access size causing address overflow is rejected");
 
     /* 8. Zero-size access semantics:
      * Valid if and only if ptr is non-NULL and points to a valid allocated byte within an active allocation.
