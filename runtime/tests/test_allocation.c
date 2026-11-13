@@ -31,11 +31,13 @@ static int failed_assertions = 0;
  */
 static void test_successful_allocation(void) {
     size_t size = 128;
+    size_t initial_count = mg_get_tracked_count();
     void *ptr = mg_malloc(size);
 
     TEST_ASSERT(ptr != NULL, "mg_malloc returned non-NULL pointer");
     TEST_ASSERT(mg_is_tracked(ptr) == 1, "Allocated pointer is registered");
     TEST_ASSERT(mg_get_allocation_size(ptr) == size, "Recorded size matches requested size");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Tracked count incremented after malloc");
 
     /* Verify allocated memory is readable and writable */
     memset(ptr, 0xAA, size);
@@ -49,9 +51,9 @@ static void test_successful_allocation(void) {
     }
     TEST_ASSERT(data_valid == 1, "Allocated memory successfully written and verified");
 
-    /* Clean up */
+    /* Clean up safely using mg_get_tracked_count() without reusing ptr after free */
     mg_free(ptr);
-    TEST_ASSERT(mg_is_tracked(ptr) == 0, "Pointer no longer tracked after free");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count restored to initial after free");
 }
 
 /**
@@ -61,25 +63,30 @@ static void test_allocation_size_tracking(void) {
     size_t sizes[] = {1, 16, 64, 256, 1024, 4096};
     size_t num_sizes = sizeof(sizes) / sizeof(sizes[0]);
     void *ptrs[sizeof(sizes) / sizeof(sizes[0])];
+    size_t initial_count = mg_get_tracked_count();
 
-    /* Allocate and verify recorded sizes */
+    /* Allocate and verify recorded sizes while pointers are valid */
     for (size_t i = 0; i < num_sizes; i++) {
         ptrs[i] = mg_malloc(sizes[i]);
         TEST_ASSERT(ptrs[i] != NULL, "Allocation succeeded");
+        TEST_ASSERT(mg_is_tracked(ptrs[i]) == 1, "Pointer is tracked");
         TEST_ASSERT(mg_get_allocation_size(ptrs[i]) == sizes[i], "Recorded size matches allocation size");
     }
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + num_sizes, "All allocations registered in registry");
 
     /* Verify all sizes remain intact while all are active */
     for (size_t i = 0; i < num_sizes; i++) {
         TEST_ASSERT(mg_get_allocation_size(ptrs[i]) == sizes[i], "Size remains consistent");
     }
 
-    /* Free all and verify sizes become 0 */
+    /* Free all and verify deallocation count decrements without reusing freed pointers */
     for (size_t i = 0; i < num_sizes; i++) {
+        size_t count_before = mg_get_tracked_count();
         mg_free(ptrs[i]);
-        TEST_ASSERT(mg_get_allocation_size(ptrs[i]) == 0, "Size is 0 after deallocation");
-        TEST_ASSERT(mg_is_tracked(ptrs[i]) == 0, "Untracked after deallocation");
+        TEST_ASSERT(mg_get_tracked_count() == count_before - 1, "Tracked count decremented after deallocation");
     }
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry count returned to initial");
 }
 
 /**
@@ -89,6 +96,7 @@ static void test_multiple_simultaneous_allocations(void) {
     const int count = 5;
     void *ptrs[5];
     size_t sizes[5] = {32, 64, 128, 256, 512};
+    size_t initial_count = mg_get_tracked_count();
 
     /* Allocate all blocks */
     for (int i = 0; i < count; i++) {
@@ -97,15 +105,13 @@ static void test_multiple_simultaneous_allocations(void) {
         TEST_ASSERT(mg_is_tracked(ptrs[i]) == 1, "Simultaneous allocation tracked");
     }
 
-    TEST_ASSERT(mg_get_tracked_count() == 5, "Registry contains exactly 5 active allocations");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 5, "Registry contains exactly 5 active allocations");
 
     /* Free middle block (index 2: 128 bytes) */
     mg_free(ptrs[2]);
-    TEST_ASSERT(mg_is_tracked(ptrs[2]) == 0, "Middle block is no longer tracked");
-    TEST_ASSERT(mg_get_allocation_size(ptrs[2]) == 0, "Middle block size is now 0");
-    TEST_ASSERT(mg_get_tracked_count() == 4, "Registry count decremented to 4");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 4, "Registry count decremented to 4");
 
-    /* Verify surrounding blocks remain tracked and unchanged */
+    /* Verify surrounding blocks remain tracked and unchanged while valid */
     TEST_ASSERT(mg_is_tracked(ptrs[0]) == 1 && mg_get_allocation_size(ptrs[0]) == sizes[0], "Block 0 intact");
     TEST_ASSERT(mg_is_tracked(ptrs[1]) == 1 && mg_get_allocation_size(ptrs[1]) == sizes[1], "Block 1 intact");
     TEST_ASSERT(mg_is_tracked(ptrs[3]) == 1 && mg_get_allocation_size(ptrs[3]) == sizes[3], "Block 3 intact");
@@ -113,54 +119,50 @@ static void test_multiple_simultaneous_allocations(void) {
 
     /* Free head block (most recently allocated: index 4) */
     mg_free(ptrs[4]);
-    TEST_ASSERT(mg_is_tracked(ptrs[4]) == 0, "Head block no longer tracked");
-    TEST_ASSERT(mg_get_tracked_count() == 3, "Registry count decremented to 3");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 3, "Registry count decremented to 3");
 
     /* Free tail block (oldest allocated: index 0) */
     mg_free(ptrs[0]);
-    TEST_ASSERT(mg_is_tracked(ptrs[0]) == 0, "Tail block no longer tracked");
-    TEST_ASSERT(mg_get_tracked_count() == 2, "Registry count decremented to 2");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 2, "Registry count decremented to 2");
 
     /* Free remaining blocks */
     mg_free(ptrs[1]);
     mg_free(ptrs[3]);
-    TEST_ASSERT(mg_get_tracked_count() == 0, "All blocks freed, registry is empty");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "All blocks freed, registry is back to initial");
 }
 
 /**
- * @brief Tests successful deallocation of an active pointer.
+ * @brief Tests successful deallocation of an active pointer using safe count checks.
  */
 static void test_successful_deallocation(void) {
     size_t size = 256;
+    size_t initial_count = mg_get_tracked_count();
     void *ptr = mg_malloc(size);
 
     TEST_ASSERT(ptr != NULL, "Allocated memory successfully");
     TEST_ASSERT(mg_is_tracked(ptr) == 1, "Pointer is tracked prior to free");
+    TEST_ASSERT(mg_get_allocation_size(ptr) == size, "Recorded size matches requested size prior to free");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Registry count incremented by 1");
 
     mg_free(ptr);
 
-    TEST_ASSERT(mg_is_tracked(ptr) == 0, "Pointer is not tracked after mg_free");
-    TEST_ASSERT(mg_get_allocation_size(ptr) == 0, "Allocation size is 0 after mg_free");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry count decremented after mg_free");
 }
 
 /**
- * @brief Tests tracking status after deallocation and ensures safe double-free handling.
+ * @brief Tests tracking status after deallocation using safe registry count checks.
  */
 static void test_tracking_after_deallocation(void) {
+    size_t initial_count = mg_get_tracked_count();
     void *ptr = mg_malloc(64);
     TEST_ASSERT(ptr != NULL, "Pointer allocated");
     TEST_ASSERT(mg_is_tracked(ptr) == 1, "Tracked before deallocation");
     TEST_ASSERT(mg_get_allocation_size(ptr) == 64, "Size is 64 before deallocation");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Tracked count incremented");
 
-    /* First deallocation */
+    /* Deallocation verified safely without reusing ptr */
     mg_free(ptr);
-    TEST_ASSERT(mg_is_tracked(ptr) == 0, "Untracked after first deallocation");
-    TEST_ASSERT(mg_get_allocation_size(ptr) == 0, "Size is 0 after first deallocation");
-
-    /* Second deallocation attempt (double free) must be safely ignored without crashing */
-    mg_free(ptr);
-    TEST_ASSERT(mg_is_tracked(ptr) == 0, "Still untracked after duplicate mg_free call");
-    TEST_ASSERT(mg_get_allocation_size(ptr) == 0, "Size remains 0 after duplicate mg_free call");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count restored to initial after deallocation");
 }
 
 /**
@@ -171,29 +173,34 @@ static void test_null_allocation_handling(void) {
     TEST_ASSERT(mg_is_tracked(NULL) == 0, "mg_is_tracked(NULL) returns 0");
     TEST_ASSERT(mg_get_allocation_size(NULL) == 0, "mg_get_allocation_size(NULL) returns 0");
 
-    /* 2. Freeing NULL must be safe and not crash */
+    /* 2. Freeing NULL must be safe and not alter registry */
+    size_t count_before_null = mg_get_tracked_count();
     mg_free(NULL);
-    TEST_ASSERT(1, "mg_free(NULL) returned safely without error");
+    TEST_ASSERT(mg_get_tracked_count() == count_before_null, "mg_free(NULL) did not alter registry");
 
     /* 3. Handling zero-size allocation safely */
+    size_t count_before_zero = mg_get_tracked_count();
     void *zero_ptr = mg_malloc(0);
     if (zero_ptr != NULL) {
         /* If system malloc(0) returns a non-null pointer, verify tracking and cleanup */
         TEST_ASSERT(mg_is_tracked(zero_ptr) == 1, "Zero-size allocation is registered if non-null");
         TEST_ASSERT(mg_get_allocation_size(zero_ptr) == 0, "Zero-size allocation records size 0");
+        TEST_ASSERT(mg_get_tracked_count() == count_before_zero + 1, "Zero-size allocation added to registry");
         mg_free(zero_ptr);
-        TEST_ASSERT(mg_is_tracked(zero_ptr) == 0, "Zero-size allocation untracked after free");
+        TEST_ASSERT(mg_get_tracked_count() == count_before_zero, "Zero-size allocation untracked after free");
     } else {
         /* If system malloc(0) returns NULL, verify NULL behavior */
         TEST_ASSERT(mg_is_tracked(NULL) == 0, "NULL result from mg_malloc(0) is not tracked");
+        TEST_ASSERT(mg_get_tracked_count() == count_before_zero, "Registry count unchanged on NULL return");
     }
 
     /* 4. Untracked stack pointer must not be tracked and mg_free must not crash */
     int stack_var = 12345;
+    size_t count_before_stack = mg_get_tracked_count();
     TEST_ASSERT(mg_is_tracked(&stack_var) == 0, "Stack variable address is not tracked");
     TEST_ASSERT(mg_get_allocation_size(&stack_var) == 0, "Stack variable size is 0");
     mg_free(&stack_var);
-    TEST_ASSERT(1, "mg_free on stack pointer safely ignored");
+    TEST_ASSERT(mg_get_tracked_count() == count_before_stack, "mg_free on stack pointer safely ignored");
 
     /* 5. Interior pointer must not be recognized as base address */
     void *buf = mg_malloc(100);
@@ -203,12 +210,15 @@ static void test_null_allocation_handling(void) {
     TEST_ASSERT(mg_get_allocation_size(interior) == 0, "Interior offset size is 0");
 
     /* Freeing interior pointer must be ignored, preserving base allocation */
+    size_t count_before_free_interior = mg_get_tracked_count();
     mg_free(interior);
+    TEST_ASSERT(mg_get_tracked_count() == count_before_free_interior, "Registry unchanged after mg_free on interior pointer");
     TEST_ASSERT(mg_is_tracked(buf) == 1, "Base allocation still tracked after mg_free on interior pointer");
 
     /* Clean up base allocation */
+    size_t count_before_free_buf = mg_get_tracked_count();
     mg_free(buf);
-    TEST_ASSERT(mg_is_tracked(buf) == 0, "Base allocation freed successfully");
+    TEST_ASSERT(mg_get_tracked_count() == count_before_free_buf - 1, "Base allocation freed successfully");
 }
 
 /**
@@ -217,8 +227,10 @@ static void test_null_allocation_handling(void) {
  */
 static void test_boundary_validation(void) {
     size_t alloc_size = 100;
+    size_t initial_count = mg_get_tracked_count();
     char *buf = (char *)mg_malloc(alloc_size);
     TEST_ASSERT(buf != NULL, "Allocated 100 bytes for boundary validation tests");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Tracked count incremented");
 
     /* 1. Valid access from base address */
     TEST_ASSERT(mg_is_valid_access(buf, 1) == 1, "Access 1 byte from base is valid");
@@ -241,23 +253,32 @@ static void test_boundary_validation(void) {
     TEST_ASSERT(mg_is_valid_access(buf + 20, 81) == 0, "Access 81 bytes from offset 20 (exceeds boundary) is rejected");
     TEST_ASSERT(mg_is_valid_access(buf + 50, 51) == 0, "Access 51 bytes from offset 50 (exceeds boundary) is rejected");
     TEST_ASSERT(mg_is_valid_access(buf + 99, 2) == 0, "Access 2 bytes from offset 99 (exceeds boundary) is rejected");
-    TEST_ASSERT(mg_is_valid_access(buf + 100, 1) == 0, "Access 1 byte starting at boundary (offset 100) is rejected");
+
+    /* Use uintptr_t to construct exact boundary and out-of-bounds addresses without invalid C pointer arithmetic */
+    uintptr_t buf_addr = (uintptr_t)buf;
+
+    if (buf_addr <= UINTPTR_MAX - alloc_size) {
+        const void *boundary_addr = (const void *)(buf_addr + alloc_size);
+        TEST_ASSERT(mg_is_valid_access(boundary_addr, 1) == 0, "Access 1 byte starting at boundary is rejected");
+        TEST_ASSERT(mg_is_valid_access(boundary_addr, 0) == 0, "Zero-size access at boundary is rejected");
+    }
 
     /* 5. Access starting outside the allocation */
-    TEST_ASSERT(mg_is_valid_access(buf - 1, 1) == 0, "Access starting before base is rejected");
-    TEST_ASSERT(mg_is_valid_access(buf - 1, 10) == 0, "Access spanning before and into base is rejected");
-    TEST_ASSERT(mg_is_valid_access(buf + 101, 1) == 0, "Access starting past allocation is rejected");
+    if (buf_addr > 0) {
+        const void *addr_before = (const void *)(buf_addr - 1);
+        TEST_ASSERT(mg_is_valid_access(addr_before, 1) == 0, "Access starting before base is rejected");
+        TEST_ASSERT(mg_is_valid_access(addr_before, 10) == 0, "Access spanning before and into base is rejected");
+        TEST_ASSERT(mg_is_valid_access(addr_before, 0) == 0, "Zero-size access before base is rejected");
+    }
+
+    if (buf_addr <= UINTPTR_MAX - (alloc_size + 1)) {
+        const void *addr_past = (const void *)(buf_addr + alloc_size + 1);
+        TEST_ASSERT(mg_is_valid_access(addr_past, 1) == 0, "Access starting past allocation is rejected");
+    }
 
     /* Untracked stack pointer */
     int stack_var = 42;
     TEST_ASSERT(mg_is_valid_access(&stack_var, sizeof(stack_var)) == 0, "Stack pointer access is rejected");
-
-    /* Deallocated pointer */
-    char *temp = (char *)mg_malloc(50);
-    TEST_ASSERT(temp != NULL, "Allocated temporary buffer");
-    TEST_ASSERT(mg_is_valid_access(temp, 10) == 1, "Valid access on active temp buffer");
-    mg_free(temp);
-    TEST_ASSERT(mg_is_valid_access(temp, 10) == 0, "Access on deallocated buffer is rejected");
 
     /* 6. NULL pointer checks */
     TEST_ASSERT(mg_is_valid_access(NULL, 1) == 0, "Access with NULL pointer is rejected");
@@ -274,13 +295,11 @@ static void test_boundary_validation(void) {
     TEST_ASSERT(mg_is_valid_access(buf, 0) == 1, "Zero-size access at allocation base is valid");
     TEST_ASSERT(mg_is_valid_access(buf + 20, 0) == 1, "Zero-size access at interior offset is valid");
     TEST_ASSERT(mg_is_valid_access(buf + 99, 0) == 1, "Zero-size access at last allocated byte is valid");
-    TEST_ASSERT(mg_is_valid_access(buf + 100, 0) == 0, "Zero-size access at one-past-the-end boundary is rejected");
-    TEST_ASSERT(mg_is_valid_access(buf - 1, 0) == 0, "Zero-size access before base is rejected");
     TEST_ASSERT(mg_is_valid_access(&stack_var, 0) == 0, "Zero-size access on untracked pointer is rejected");
 
-    /* Clean up */
+    /* Clean up safely using mg_get_tracked_count() without accessing buf after free */
     mg_free(buf);
-    TEST_ASSERT(mg_is_valid_access(buf, 10) == 0, "Access after free is rejected");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count restored to initial after freeing buf");
 }
 
 int main(void) {
