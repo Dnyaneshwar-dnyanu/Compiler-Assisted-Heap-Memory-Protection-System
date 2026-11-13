@@ -8,18 +8,6 @@ extern "C" {
 #endif
 
 /**
- * @brief Metadata structure for an active heap memory allocation.
- *
- * Each active allocation managed by MemoryGuard is represented by an
- * instance of this structure in the allocation registry's linked list.
- */
-typedef struct Allocation {
-    void *address;              /**< Starting base address of the allocated memory */
-    size_t size;                /**< Size of the allocated memory in bytes */
-    struct Allocation *next;    /**< Pointer to the next metadata entry in the registry */
-} Allocation;
-
-/**
  * @brief Allocates heap memory and records it in the allocation registry.
  *
  * Allocates `size` bytes of memory using standard malloc, creates an Allocation

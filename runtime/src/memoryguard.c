@@ -2,6 +2,19 @@
 #include <stdlib.h>
 
 /**
+ * @brief Private metadata structure for an active heap memory allocation.
+ *
+ * Internal to the runtime implementation. Each active allocation managed by
+ * MemoryGuard is represented by an instance of this structure in the allocation
+ * registry's linked list.
+ */
+typedef struct Allocation {
+    void *address;              /**< Starting base address of the allocated memory */
+    size_t size;                /**< Size of the allocated memory in bytes */
+    struct Allocation *next;    /**< Pointer to the next metadata entry in the registry */
+} Allocation;
+
+/**
  * @brief Head of the singly linked list storing active allocation metadata.
  *
  * Internal module state representing the MemoryGuard allocation registry.
