@@ -62,6 +62,31 @@ size_t mg_get_allocation_size(const void *ptr);
  */
 size_t mg_get_tracked_count(void);
 
+/**
+ * @brief Validates whether a memory access range lies entirely within a single tracked allocation.
+ *
+ * Checks if the requested access range [ptr, ptr + access_size) belongs
+ * completely to an active heap allocation tracked by MemoryGuard.
+ * Supports interior pointers.
+ *
+ * Safely rejects:
+ *  - NULL pointers
+ *  - Pointers outside all tracked allocations
+ *  - Accesses extending beyond allocation boundaries
+ *  - Accesses that overflow address calculations
+ *
+ * Zero-size access semantics (access_size == 0):
+ *  - Returns 1 if and only if ptr is non-NULL and points to a valid allocated byte
+ *    within an active allocation (alloc_start <= ptr < alloc_end).
+ *  - Returns 0 if ptr is NULL, points at or beyond the boundary (ptr >= alloc_end),
+ *    points before alloc_start, or refers to a zero-sized allocation.
+ *
+ * @param ptr Starting address of the memory access.
+ * @param access_size Size of the memory access in bytes.
+ * @return int 1 if the access is valid, 0 otherwise.
+ */
+int mg_is_valid_access(const void *ptr, size_t access_size);
+
 #ifdef __cplusplus
 }
 #endif

@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 static int total_assertions = 0;
 static int failed_assertions = 0;
@@ -210,6 +211,78 @@ static void test_null_allocation_handling(void) {
     TEST_ASSERT(mg_is_tracked(buf) == 0, "Base allocation freed successfully");
 }
 
+/**
+ * @brief Tests heap boundary validation (mg_is_valid_access) including base,
+ *        interior pointers, boundaries, overflows, NULL, and zero-size accesses.
+ */
+static void test_boundary_validation(void) {
+    size_t alloc_size = 100;
+    char *buf = (char *)mg_malloc(alloc_size);
+    TEST_ASSERT(buf != NULL, "Allocated 100 bytes for boundary validation tests");
+
+    /* 1. Valid access from base address */
+    TEST_ASSERT(mg_is_valid_access(buf, 1) == 1, "Access 1 byte from base is valid");
+    TEST_ASSERT(mg_is_valid_access(buf, 10) == 1, "Access 10 bytes from base is valid");
+    TEST_ASSERT(mg_is_valid_access(buf, 50) == 1, "Access 50 bytes from base is valid");
+    TEST_ASSERT(mg_is_valid_access(buf, 100) == 1, "Access full 100 bytes from base is valid");
+
+    /* 2. Valid access through an interior pointer */
+    TEST_ASSERT(mg_is_valid_access(buf + 20, 10) == 1, "Access 10 bytes starting at offset 20 is valid");
+    TEST_ASSERT(mg_is_valid_access(buf + 20, 80) == 1, "Access 80 bytes starting at offset 20 is valid");
+    TEST_ASSERT(mg_is_valid_access(buf + 99, 1) == 1, "Access 1 byte at last index 99 is valid");
+
+    /* 3. Access ending exactly at the allocation boundary */
+    TEST_ASSERT(mg_is_valid_access(buf, 100) == 1, "Access from 0 to exactly boundary (100) is valid");
+    TEST_ASSERT(mg_is_valid_access(buf + 50, 50) == 1, "Access from offset 50 to boundary (100) is valid");
+    TEST_ASSERT(mg_is_valid_access(buf + 99, 1) == 1, "Access from offset 99 to boundary (100) is valid");
+
+    /* 4. Access extending beyond the boundary */
+    TEST_ASSERT(mg_is_valid_access(buf, 101) == 0, "Access 101 bytes from base (exceeds boundary) is rejected");
+    TEST_ASSERT(mg_is_valid_access(buf + 20, 81) == 0, "Access 81 bytes from offset 20 (exceeds boundary) is rejected");
+    TEST_ASSERT(mg_is_valid_access(buf + 50, 51) == 0, "Access 51 bytes from offset 50 (exceeds boundary) is rejected");
+    TEST_ASSERT(mg_is_valid_access(buf + 99, 2) == 0, "Access 2 bytes from offset 99 (exceeds boundary) is rejected");
+    TEST_ASSERT(mg_is_valid_access(buf + 100, 1) == 0, "Access 1 byte starting at boundary (offset 100) is rejected");
+
+    /* 5. Access starting outside the allocation */
+    TEST_ASSERT(mg_is_valid_access(buf - 1, 1) == 0, "Access starting before base is rejected");
+    TEST_ASSERT(mg_is_valid_access(buf - 1, 10) == 0, "Access spanning before and into base is rejected");
+    TEST_ASSERT(mg_is_valid_access(buf + 101, 1) == 0, "Access starting past allocation is rejected");
+
+    /* Untracked stack pointer */
+    int stack_var = 42;
+    TEST_ASSERT(mg_is_valid_access(&stack_var, sizeof(stack_var)) == 0, "Stack pointer access is rejected");
+
+    /* Deallocated pointer */
+    char *temp = (char *)mg_malloc(50);
+    TEST_ASSERT(temp != NULL, "Allocated temporary buffer");
+    TEST_ASSERT(mg_is_valid_access(temp, 10) == 1, "Valid access on active temp buffer");
+    mg_free(temp);
+    TEST_ASSERT(mg_is_valid_access(temp, 10) == 0, "Access on deallocated buffer is rejected");
+
+    /* 6. NULL pointer checks */
+    TEST_ASSERT(mg_is_valid_access(NULL, 1) == 0, "Access with NULL pointer is rejected");
+    TEST_ASSERT(mg_is_valid_access(NULL, 10) == 0, "Access 10 bytes with NULL pointer is rejected");
+    TEST_ASSERT(mg_is_valid_access(NULL, 0) == 0, "Zero-size access with NULL pointer is rejected");
+
+    /* 7. Address calculation overflow checks */
+    TEST_ASSERT(mg_is_valid_access(buf, (size_t)-1) == 0, "Huge access size causing address overflow is rejected");
+    TEST_ASSERT(mg_is_valid_access((const void *)(UINTPTR_MAX - 5), 10) == 0, "Overflowing pointer+size calculation is rejected");
+
+    /* 8. Zero-size access semantics:
+     * Valid if and only if ptr is non-NULL and points to a valid allocated byte within an active allocation.
+     */
+    TEST_ASSERT(mg_is_valid_access(buf, 0) == 1, "Zero-size access at allocation base is valid");
+    TEST_ASSERT(mg_is_valid_access(buf + 20, 0) == 1, "Zero-size access at interior offset is valid");
+    TEST_ASSERT(mg_is_valid_access(buf + 99, 0) == 1, "Zero-size access at last allocated byte is valid");
+    TEST_ASSERT(mg_is_valid_access(buf + 100, 0) == 0, "Zero-size access at one-past-the-end boundary is rejected");
+    TEST_ASSERT(mg_is_valid_access(buf - 1, 0) == 0, "Zero-size access before base is rejected");
+    TEST_ASSERT(mg_is_valid_access(&stack_var, 0) == 0, "Zero-size access on untracked pointer is rejected");
+
+    /* Clean up */
+    mg_free(buf);
+    TEST_ASSERT(mg_is_valid_access(buf, 10) == 0, "Access after free is rejected");
+}
+
 int main(void) {
     printf("========================================\n");
     printf("  MemoryGuard Allocation Registry Tests \n");
@@ -221,6 +294,7 @@ int main(void) {
     RUN_TEST(test_successful_deallocation);
     RUN_TEST(test_tracking_after_deallocation);
     RUN_TEST(test_null_allocation_handling);
+    RUN_TEST(test_boundary_validation);
 
     printf("========================================\n");
     printf("Summary: %d assertions, %d failed\n", total_assertions, failed_assertions);

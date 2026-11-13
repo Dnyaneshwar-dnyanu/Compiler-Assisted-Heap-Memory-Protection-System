@@ -1,5 +1,6 @@
 #include "memoryguard.h"
 #include <stdlib.h>
+#include <stdint.h>
 
 /**
  * @brief Private metadata structure for an active heap memory allocation.
@@ -123,4 +124,51 @@ size_t mg_get_tracked_count(void) {
         curr = curr->next;
     }
     return count;
+}
+
+int mg_is_valid_access(const void *ptr, size_t access_size) {
+    /* Reject NULL pointers */
+    if (ptr == NULL) {
+        return 0;
+    }
+
+    uintptr_t access_start = (uintptr_t)ptr;
+
+    /* Reject accesses where address arithmetic overflows */
+    if (UINTPTR_MAX - access_start < access_size) {
+        return 0;
+    }
+
+    uintptr_t access_end = access_start + access_size;
+
+    const Allocation *curr = allocation_registry;
+    while (curr != NULL) {
+        uintptr_t alloc_start = (uintptr_t)curr->address;
+        size_t alloc_size = curr->size;
+
+        /* Defensive check: ensure allocation range arithmetic does not overflow */
+        if (UINTPTR_MAX - alloc_start < alloc_size) {
+            curr = curr->next;
+            continue;
+        }
+
+        uintptr_t alloc_end = alloc_start + alloc_size;
+
+        if (access_size > 0) {
+            /* Access range [access_start, access_end) must be entirely within [alloc_start, alloc_end) */
+            if (access_start >= alloc_start && access_end <= alloc_end) {
+                return 1;
+            }
+        } else {
+            /* Zero-size access: valid iff ptr points to an allocated byte (alloc_start <= ptr < alloc_end) */
+            if (access_start >= alloc_start && access_start < alloc_end) {
+                return 1;
+            }
+        }
+
+        curr = curr->next;
+    }
+
+    /* Pointer/range is outside all tracked allocations */
+    return 0;
 }
