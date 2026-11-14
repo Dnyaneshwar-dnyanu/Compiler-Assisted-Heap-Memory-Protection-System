@@ -297,3 +297,55 @@ void *mg_realloc_external(void *ptr, size_t new_size) {
     curr->size = new_size;
     return new_ptr;
 }
+
+void *mg_intercept_malloc(size_t size) {
+    void *ptr = malloc(size);
+    if (ptr == NULL) {
+        return NULL;
+    }
+
+    if (!mg_register_external(ptr, size)) {
+        free(ptr);
+        return NULL;
+    }
+
+    return ptr;
+}
+
+void *mg_intercept_calloc(size_t nmemb, size_t size) {
+    /* Prevent integer multiplication overflow */
+    if (nmemb != 0 && size > SIZE_MAX / nmemb) {
+        return NULL;
+    }
+
+    size_t total_size = nmemb * size;
+    void *ptr = calloc(nmemb, size);
+    if (ptr == NULL) {
+        return NULL;
+    }
+
+    if (!mg_register_external(ptr, total_size)) {
+        free(ptr);
+        return NULL;
+    }
+
+    return ptr;
+}
+
+void *mg_intercept_realloc(void *ptr, size_t size) {
+    if (ptr == NULL) {
+        return mg_intercept_malloc(size);
+    }
+
+    return mg_realloc_external(ptr, size);
+}
+
+void mg_intercept_free(void *ptr) {
+    if (ptr == NULL) {
+        return;
+    }
+
+    mg_unregister_external(ptr);
+    free(ptr);
+}
+

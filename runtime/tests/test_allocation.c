@@ -552,6 +552,214 @@ static void test_check_access(void) {
 #endif
 }
 
+/**
+ * @brief Tests the allocator interceptor APIs (mg_intercept_malloc,
+ *        mg_intercept_calloc, mg_intercept_realloc, mg_intercept_free).
+ */
+static void test_interceptor_apis(void) {
+    size_t initial_count = mg_get_tracked_count();
+
+    /* =========================================================================
+     * 1. mg_intercept_malloc
+     * ========================================================================= */
+    size_t m_size = 128;
+    void *m_ptr = mg_intercept_malloc(m_size);
+    TEST_ASSERT(m_ptr != NULL, "mg_intercept_malloc returned non-NULL");
+    TEST_ASSERT(mg_is_tracked(m_ptr) == 1, "mg_intercept_malloc buffer is tracked in registry");
+    TEST_ASSERT(mg_get_allocation_size(m_ptr) == m_size, "mg_intercept_malloc recorded size matches requested size");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Registry count incremented after intercept_malloc");
+
+    /* Validate memory readability, writability, and boundary checks */
+    memset(m_ptr, 0x33, m_size);
+    TEST_ASSERT(((unsigned char *)m_ptr)[0] == 0x33, "Buffer is writable");
+    TEST_ASSERT(mg_is_valid_access(m_ptr, 1) == 1, "Access 1 byte is valid");
+    TEST_ASSERT(mg_is_valid_access(m_ptr, m_size) == 1, "Access full size is valid");
+    TEST_ASSERT(mg_is_valid_access((char *)m_ptr + 20, 50) == 1, "Interior access is valid");
+    TEST_ASSERT(mg_is_valid_access(m_ptr, m_size + 1) == 0, "Access beyond boundary rejected");
+
+    /* Deallocate via mg_intercept_free */
+    mg_intercept_free(m_ptr);
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry count restored after mg_intercept_free");
+    TEST_ASSERT(mg_is_tracked(m_ptr) == 0, "Buffer no longer tracked after mg_intercept_free");
+    TEST_ASSERT(mg_is_valid_access(m_ptr, 1) == 0, "Access to freed buffer rejected");
+
+#if defined(__unix__) || defined(__linux__) || defined(__APPLE__)
+    TEST_ASSERT(check_access_aborts(m_ptr, 1),
+                "mg_check_access aborts on use-after-free following mg_intercept_free");
+#endif
+
+    /* Zero-size intercept_malloc */
+    void *m_zero = mg_intercept_malloc(0);
+    if (m_zero != NULL) {
+        TEST_ASSERT(mg_is_tracked(m_zero) == 1, "Zero-sized malloc tracked if non-NULL");
+        TEST_ASSERT(mg_get_allocation_size(m_zero) == 0, "Zero-sized malloc recorded size is 0");
+        mg_intercept_free(m_zero);
+        TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry restored after zero-sized free");
+    }
+
+    /* Extreme size failure test */
+    void *m_fail = mg_intercept_malloc(SIZE_MAX);
+    TEST_ASSERT(m_fail == NULL, "mg_intercept_malloc(SIZE_MAX) returns NULL");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry count unchanged on malloc failure");
+
+    /* =========================================================================
+     * 2. mg_intercept_calloc
+     * ========================================================================= */
+    size_t c_nmemb = 16;
+    size_t c_elem_size = 4;
+    size_t c_total = c_nmemb * c_elem_size; /* 64 bytes */
+    void *c_ptr = mg_intercept_calloc(c_nmemb, c_elem_size);
+    TEST_ASSERT(c_ptr != NULL, "mg_intercept_calloc returned non-NULL");
+    TEST_ASSERT(mg_is_tracked(c_ptr) == 1, "calloc buffer is tracked");
+    TEST_ASSERT(mg_get_allocation_size(c_ptr) == c_total, "calloc recorded size matches nmemb * size");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Registry count incremented by 1");
+
+    /* Verify zero-initialization */
+    int all_zeros = 1;
+    unsigned char *c_bytes = (unsigned char *)c_ptr;
+    for (size_t i = 0; i < c_total; i++) {
+        if (c_bytes[i] != 0) {
+            all_zeros = 0;
+            break;
+        }
+    }
+    TEST_ASSERT(all_zeros == 1, "mg_intercept_calloc memory is zero-initialized");
+    TEST_ASSERT(mg_is_valid_access(c_ptr, c_total) == 1, "Full calloc buffer range is valid access");
+    TEST_ASSERT(mg_is_valid_access(c_ptr, c_total + 1) == 0, "Access beyond calloc boundary is rejected");
+
+    mg_intercept_free(c_ptr);
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry count restored after freeing calloc buffer");
+
+    /* Calloc zero element count or size */
+    void *c_zero1 = mg_intercept_calloc(0, 10);
+    if (c_zero1 != NULL) {
+        TEST_ASSERT(mg_is_tracked(c_zero1) == 1, "calloc(0, 10) tracked if non-NULL");
+        mg_intercept_free(c_zero1);
+    }
+    void *c_zero2 = mg_intercept_calloc(10, 0);
+    if (c_zero2 != NULL) {
+        TEST_ASSERT(mg_is_tracked(c_zero2) == 1, "calloc(10, 0) tracked if non-NULL");
+        mg_intercept_free(c_zero2);
+    }
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry clean after zero calloc tests");
+
+    /* Multiplication overflow rejection in calloc */
+    void *c_ov1 = mg_intercept_calloc(SIZE_MAX, 2);
+    TEST_ASSERT(c_ov1 == NULL, "mg_intercept_calloc(SIZE_MAX, 2) rejects overflow and returns NULL");
+    void *c_ov2 = mg_intercept_calloc(SIZE_MAX / 2 + 1, 3);
+    TEST_ASSERT(c_ov2 == NULL, "mg_intercept_calloc rejects multiplication overflow");
+    void *c_ov3 = mg_intercept_calloc(SIZE_MAX, SIZE_MAX);
+    TEST_ASSERT(c_ov3 == NULL, "mg_intercept_calloc(SIZE_MAX, SIZE_MAX) rejects overflow");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry unchanged after overflow rejection");
+
+    /* Single extreme element size failure */
+    void *c_fail = mg_intercept_calloc(1, SIZE_MAX);
+    TEST_ASSERT(c_fail == NULL, "mg_intercept_calloc(1, SIZE_MAX) returns NULL on allocation failure");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry unchanged on calloc failure");
+
+    /* =========================================================================
+     * 3. mg_intercept_realloc
+     * ========================================================================= */
+    /* 3a. NULL pointer behaves as malloc: allocates and registers */
+    size_t r_init_size = 64;
+    void *r_ptr = mg_intercept_realloc(NULL, r_init_size);
+    TEST_ASSERT(r_ptr != NULL, "mg_intercept_realloc(NULL, size) behaves like malloc");
+    TEST_ASSERT(mg_is_tracked(r_ptr) == 1, "Buffer from NULL realloc is registered");
+    TEST_ASSERT(mg_get_allocation_size(r_ptr) == r_init_size, "Registered size matches requested size");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Registry count incremented by 1");
+
+    memset(r_ptr, 0x77, r_init_size);
+
+    /* 3b. Successful expansion / relocation */
+    size_t r_expanded_size = 256;
+    void *r_expanded = mg_intercept_realloc(r_ptr, r_expanded_size);
+    TEST_ASSERT(r_expanded != NULL, "mg_intercept_realloc expansion succeeded");
+    TEST_ASSERT(mg_is_tracked(r_expanded) == 1, "Expanded buffer is tracked");
+    TEST_ASSERT(mg_get_allocation_size(r_expanded) == r_expanded_size, "Expanded size updated in registry");
+    TEST_ASSERT(mg_is_valid_access(r_expanded, r_expanded_size) == 1, "Full expanded range is valid");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Registry maintains single allocation entry");
+
+    /* Verify original data preserved in expanded buffer without reusing r_ptr */
+    unsigned char *exp_bytes = (unsigned char *)r_expanded;
+    int data_preserved = 1;
+    for (size_t i = 0; i < r_init_size; i++) {
+        if (exp_bytes[i] != 0x77) {
+            data_preserved = 0;
+            break;
+        }
+    }
+    TEST_ASSERT(data_preserved == 1, "Original data preserved across realloc expansion");
+
+    /* 3c. Successful shrinking */
+    size_t r_shrunk_size = 32;
+    void *r_shrunk = mg_intercept_realloc(r_expanded, r_shrunk_size);
+    TEST_ASSERT(r_shrunk != NULL, "mg_intercept_realloc shrinking succeeded");
+    TEST_ASSERT(mg_is_tracked(r_shrunk) == 1, "Shrunk buffer is tracked");
+    TEST_ASSERT(mg_get_allocation_size(r_shrunk) == r_shrunk_size, "Shrunk size updated in registry");
+    TEST_ASSERT(mg_is_valid_access(r_shrunk, r_shrunk_size) == 1, "Shrunk size is valid access");
+    TEST_ASSERT(mg_is_valid_access(r_shrunk, r_shrunk_size + 1) == 0, "Access beyond shrunk size is rejected");
+
+    /* 3d. Reallocation failure: original buffer and registry preserved untouched */
+    void *r_fail = mg_intercept_realloc(r_shrunk, SIZE_MAX);
+    TEST_ASSERT(r_fail == NULL, "mg_intercept_realloc(..., SIZE_MAX) returns NULL");
+    TEST_ASSERT(mg_is_tracked(r_shrunk) == 1, "Original pointer is STILL tracked after realloc failure");
+    TEST_ASSERT(mg_get_allocation_size(r_shrunk) == r_shrunk_size, "Original size preserved after realloc failure");
+    TEST_ASSERT(mg_is_valid_access(r_shrunk, r_shrunk_size) == 1, "Original range remains valid after realloc failure");
+    TEST_ASSERT(((unsigned char *)r_shrunk)[0] == 0x77, "Original buffer content intact after realloc failure");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Registry count unchanged on realloc failure");
+
+    /* Clean up shrunk buffer */
+    mg_intercept_free(r_shrunk);
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry count restored after freeing shrunk buffer");
+
+    /* 3e. Reallocating untracked memory */
+    void *untracked_buf = malloc(48);
+    TEST_ASSERT(untracked_buf != NULL, "Allocated untracked buffer for realloc test");
+    TEST_ASSERT(mg_is_tracked(untracked_buf) == 0, "Buffer is initially untracked");
+
+    void *untracked_realloc = mg_intercept_realloc(untracked_buf, 96);
+    TEST_ASSERT(untracked_realloc != NULL, "Reallocating untracked buffer succeeded");
+    TEST_ASSERT(mg_is_tracked(untracked_realloc) == 0, "Untracked buffer remains untracked");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry count unchanged");
+    mg_intercept_free(untracked_realloc);
+
+    /* 3f. Reallocation with size == 0 */
+    void *zero_target = mg_intercept_malloc(50);
+    TEST_ASSERT(zero_target != NULL, "Allocated buffer for realloc(ptr, 0)");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Count incremented");
+
+    void *zero_realloc_res = mg_intercept_realloc(zero_target, 0);
+    if (zero_realloc_res == NULL) {
+        /* Standard glibc: buffer freed and NULL returned */
+        TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry entry cleaned up on realloc(ptr, 0) NULL return");
+        TEST_ASSERT(mg_is_tracked(zero_target) == 0, "Pointer no longer tracked");
+    } else {
+        /* Non-null zero-sized buffer */
+        TEST_ASSERT(mg_is_tracked(zero_realloc_res) == 1, "Non-null zero realloc tracked");
+        TEST_ASSERT(mg_get_allocation_size(zero_realloc_res) == 0, "Recorded size is 0");
+        mg_intercept_free(zero_realloc_res);
+        TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry restored");
+    }
+
+    /* =========================================================================
+     * 4. mg_intercept_free
+     * ========================================================================= */
+    /* 4a. NULL pointer free is safe */
+    size_t count_before_null = mg_get_tracked_count();
+    mg_intercept_free(NULL);
+    TEST_ASSERT(mg_get_tracked_count() == count_before_null, "mg_intercept_free(NULL) did not alter registry");
+
+    /* 4b. Freeing an untracked pointer calls libc free without error */
+    void *untracked_to_free = malloc(64);
+    TEST_ASSERT(untracked_to_free != NULL, "Allocated untracked buffer to test free");
+    TEST_ASSERT(mg_is_tracked(untracked_to_free) == 0, "Buffer is untracked");
+    mg_intercept_free(untracked_to_free);
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry count unchanged after freeing untracked pointer");
+
+    /* Final assertion count check */
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry count perfectly restored after all interceptor tests");
+}
+
 int main(void) {
     printf("========================================\n");
     printf("  MemoryGuard Allocation Registry Tests \n");
@@ -566,6 +774,7 @@ int main(void) {
     RUN_TEST(test_boundary_validation);
     RUN_TEST(test_external_allocations);
     RUN_TEST(test_check_access);
+    RUN_TEST(test_interceptor_apis);
 
     printf("========================================\n");
     printf("Summary: %d assertions, %d failed\n", total_assertions, failed_assertions);

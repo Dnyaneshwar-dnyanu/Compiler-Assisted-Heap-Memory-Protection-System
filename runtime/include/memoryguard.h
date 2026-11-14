@@ -160,6 +160,68 @@ int mg_unregister_external(void *ptr);
  */
 void *mg_realloc_external(void *ptr, size_t new_size);
 
+/**
+ * @brief Allocator interceptor: allocates memory and automatically registers it.
+ *
+ * Allocates `size` bytes using standard libc malloc. Upon successful allocation,
+ * registers the resulting memory buffer in the MemoryGuard registry via
+ * mg_register_external().
+ *
+ * If either the payload allocation or the metadata registration fails, any allocated
+ * memory is safely freed and NULL is returned.
+ *
+ * @param size Number of bytes to allocate.
+ * @return void* Pointer to the allocated and tracked buffer, or NULL on failure.
+ */
+void *mg_intercept_malloc(size_t size);
+
+/**
+ * @brief Allocator interceptor: allocates zero-initialized array and registers it.
+ *
+ * Performs safe multiplication overflow checking on `nmemb * size`. If multiplication
+ * would overflow size_t, returns NULL immediately without allocating.
+ *
+ * Allocates memory using standard libc calloc and registers the total allocated
+ * byte count in the MemoryGuard registry via mg_register_external().
+ *
+ * If either allocation or registration fails, memory is freed and NULL is returned.
+ *
+ * @param nmemb Number of elements to allocate.
+ * @param size Size in bytes of each element.
+ * @return void* Pointer to the allocated, zero-initialized, and tracked buffer, or NULL on failure.
+ */
+void *mg_intercept_calloc(size_t nmemb, size_t size);
+
+/**
+ * @brief Allocator interceptor: reallocates memory and updates registry tracking.
+ *
+ * Intercepts standard realloc calls:
+ *  - If ptr is NULL, behaves like mg_intercept_malloc(size), allocating and registering.
+ *  - If ptr is non-NULL, delegates to mg_realloc_external(ptr, size), which handles:
+ *      * Successful in-place expansion/relocation (updates registry address and size).
+ *      * Reallocation failure (preserves original registry entry untouched).
+ *      * Zero-size deallocation (unregisters and frees entry if NULL is returned).
+ *      * Untracked pointers (passes through to standard realloc safely).
+ *
+ * @param ptr Existing pointer to reallocate, or NULL.
+ * @param size Requested new size in bytes.
+ * @return void* Pointer to reallocated and tracked memory, or NULL on failure / deallocation.
+ */
+void *mg_intercept_realloc(void *ptr, size_t size);
+
+/**
+ * @brief Allocator interceptor: unregisters tracked metadata and frees memory.
+ *
+ * Unregisters `ptr` from the MemoryGuard registry (if tracked) and always calls
+ * standard libc free(ptr) for non-NULL pointers.
+ *
+ * Safe for NULL pointers (no-op) and untracked pointers (calls libc free without
+ * registry errors, preventing memory leaks for uninstrumented external allocations).
+ *
+ * @param ptr Pointer to the memory buffer to free.
+ */
+void mg_intercept_free(void *ptr);
+
 #ifdef __cplusplus
 }
 #endif
