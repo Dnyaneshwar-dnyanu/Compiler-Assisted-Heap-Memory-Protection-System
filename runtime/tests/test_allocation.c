@@ -643,19 +643,40 @@ static void test_interceptor_apis(void) {
     }
     TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry clean after zero calloc tests");
 
-    /* Multiplication overflow rejection in calloc */
+    /* Verify that registry remains unchanged across all calloc failure paths.
+     * Establish an active sentinel allocation to ensure existing entries are unaffected. */
+    void *sentinel = mg_intercept_malloc(64);
+    TEST_ASSERT(sentinel != NULL, "Sentinel allocation succeeded before calloc failure tests");
+    size_t count_with_sentinel = mg_get_tracked_count();
+    TEST_ASSERT(count_with_sentinel == initial_count + 1, "Registry count has exactly sentinel allocation");
+
+    /* 1. Multiplication overflow rejection with SIZE_MAX */
     void *c_ov1 = mg_intercept_calloc(SIZE_MAX, 2);
     TEST_ASSERT(c_ov1 == NULL, "mg_intercept_calloc(SIZE_MAX, 2) rejects overflow and returns NULL");
+    TEST_ASSERT(mg_get_tracked_count() == count_with_sentinel, "Registry unchanged after overflow rejection (SIZE_MAX, 2)");
+    TEST_ASSERT(mg_is_tracked(sentinel) == 1, "Sentinel allocation remains tracked after calloc overflow");
+    TEST_ASSERT(mg_is_valid_access(sentinel, 64) == 1, "Sentinel access remains valid after calloc overflow");
+
+    /* 2. Multiplication overflow with non-trivial operands */
     void *c_ov2 = mg_intercept_calloc(SIZE_MAX / 2 + 1, 3);
     TEST_ASSERT(c_ov2 == NULL, "mg_intercept_calloc rejects multiplication overflow");
+    TEST_ASSERT(mg_get_tracked_count() == count_with_sentinel, "Registry unchanged after overflow rejection");
+
+    /* 3. Extreme overflow with both operands large */
     void *c_ov3 = mg_intercept_calloc(SIZE_MAX, SIZE_MAX);
     TEST_ASSERT(c_ov3 == NULL, "mg_intercept_calloc(SIZE_MAX, SIZE_MAX) rejects overflow");
-    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry unchanged after overflow rejection");
+    TEST_ASSERT(mg_get_tracked_count() == count_with_sentinel, "Registry unchanged after overflow rejection");
 
-    /* Single extreme element size failure */
+    /* 4. Single extreme element size failure (allocation failure path where calloc returns NULL) */
     void *c_fail = mg_intercept_calloc(1, SIZE_MAX);
     TEST_ASSERT(c_fail == NULL, "mg_intercept_calloc(1, SIZE_MAX) returns NULL on allocation failure");
-    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry unchanged on calloc failure");
+    TEST_ASSERT(mg_get_tracked_count() == count_with_sentinel, "Registry unchanged on calloc failure");
+    TEST_ASSERT(mg_is_tracked(sentinel) == 1, "Sentinel remains tracked after allocation failure");
+    TEST_ASSERT(mg_get_allocation_size(sentinel) == 64, "Sentinel size unchanged after allocation failure");
+
+    /* Clean up sentinel */
+    mg_intercept_free(sentinel);
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry restored to initial after freeing sentinel");
 
     /* =========================================================================
      * 3. mg_intercept_realloc

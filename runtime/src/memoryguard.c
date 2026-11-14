@@ -324,6 +324,7 @@ void *mg_intercept_calloc(size_t nmemb, size_t size) {
         return NULL;
     }
 
+    /* If registration fails, release payload memory to prevent leak and return NULL */
     if (!mg_register_external(ptr, total_size)) {
         free(ptr);
         return NULL;
