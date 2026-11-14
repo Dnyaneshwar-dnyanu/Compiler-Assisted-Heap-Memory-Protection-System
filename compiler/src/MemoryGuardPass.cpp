@@ -3,6 +3,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
@@ -43,6 +44,8 @@ static StringRef originToString(PointerOrigin Origin) {
 
 /**
  * @brief Checks if a Value represents a direct call to standard heap allocation APIs.
+ *
+ * Requires both the callsite and the called function to use the standard C calling convention.
  */
 static bool isHeapAllocCall(const Value *V) {
     auto *CB = dyn_cast<CallBase>(V);
@@ -56,7 +59,8 @@ static bool isHeapAllocCall(const Value *V) {
     if (!CB->getType()->isPointerTy()) {
         return false;
     }
-    if (Callee->getCallingConv() != CallingConv::C && CB->getCallingConv() != CallingConv::C) {
+    // Require both the callsite and the called function to use the C calling convention
+    if (Callee->getCallingConv() != CallingConv::C || CB->getCallingConv() != CallingConv::C) {
         return false;
     }
 
@@ -73,8 +77,40 @@ static bool isHeapAllocCall(const Value *V) {
     return false;
 }
 
+/**
+ * @brief RAII helper for recursion-path-based cycle detection.
+ *
+ * Adds the value to the visited set upon entry and removes it upon scope exit,
+ * ensuring independent branches (e.g. SelectInst arms, PHI incoming edges, multiple stores)
+ * do not interfere with each other's visited state while preventing cyclic recursion.
+ */
+class PathVisitedScope {
+    SmallPtrSetImpl<const Value *> &Visited;
+    const Value *Val;
+    bool Inserted;
+
+public:
+    PathVisitedScope(SmallPtrSetImpl<const Value *> &Set, const Value *V)
+        : Visited(Set), Val(V), Inserted(false) {
+        if (Val) {
+            Inserted = Visited.insert(Val).second;
+        }
+    }
+
+    ~PathVisitedScope() {
+        if (Inserted && Val) {
+            Visited.erase(Val);
+        }
+    }
+
+    bool isCycle() const {
+        return !Inserted;
+    }
+};
+
 // Forward declaration
 static PointerOrigin tracePointerOrigin(const Value *V,
+                                        const DominatorTree *DT,
                                         SmallPtrSetImpl<const Value *> &Visited,
                                         unsigned Depth);
 
@@ -85,16 +121,21 @@ static constexpr unsigned MaxTraversalDepth = 8;
  *
  * An alloca itself represents stack memory. However, if a pointer loaded from an
  * alloca is dereferenced, that loaded pointer may point to heap memory.
- * This helper traces the value(s) stored into the alloca if its address never escapes.
+ *
+ * Strict correctness requirements:
+ *  - Only classify a pointer from a store when that store is proven to dominate the load.
+ *  - Do not use fallbacks based on all stores in the function agreeing.
+ *  - If no dominating store can be established, return UNKNOWN.
  */
 static PointerOrigin traceAllocaOrigin(const AllocaInst *AI, const LoadInst *LI,
+                                       const DominatorTree *DT,
                                        SmallPtrSetImpl<const Value *> &Visited,
                                        unsigned Depth) {
     // Collect all stores to AI and check if AI's address escapes
     SmallVector<const StoreInst *, 4> Stores;
     for (const User *U : AI->users()) {
         if (auto *SI = dyn_cast<StoreInst>(U)) {
-            // If AI is stored as a value (e.g. storing &AI into another pointer), it escapes
+            // If AI is stored as a value (e.g. storing &AI), it escapes
             if (SI->getValueOperand() == AI) {
                 return PointerOrigin::UNKNOWN;
             }
@@ -112,7 +153,7 @@ static PointerOrigin traceAllocaOrigin(const AllocaInst *AI, const LoadInst *LI,
             }
             return PointerOrigin::UNKNOWN;
         } else {
-            // Any other use (call argument, GEP, etc.) means AI potentially escapes
+            // Any other use means AI potentially escapes or has complex aliases
             return PointerOrigin::UNKNOWN;
         }
     }
@@ -121,57 +162,56 @@ static PointerOrigin traceAllocaOrigin(const AllocaInst *AI, const LoadInst *LI,
         return PointerOrigin::UNKNOWN;
     }
 
-    // Attempt to find the dominating store within the same basic block preceding LI
-    const StoreInst *DominatingStore = nullptr;
+    // 1. Intra-basic-block dominating store:
+    // If there is a store to AI in the same basic block preceding LI,
+    // the most recent such store strictly dominates and reaches LI.
+    const StoreInst *LocalDominatingStore = nullptr;
     for (const Instruction *I = LI->getPrevNode(); I != nullptr; I = I->getPrevNode()) {
         if (auto *SI = dyn_cast<StoreInst>(I)) {
             if (SI->getPointerOperand() == AI) {
-                DominatingStore = SI;
+                LocalDominatingStore = SI;
                 break;
             }
         }
     }
 
-    if (DominatingStore) {
-        return tracePointerOrigin(DominatingStore->getValueOperand(), Visited, Depth + 1);
+    if (LocalDominatingStore) {
+        return tracePointerOrigin(LocalDominatingStore->getValueOperand(), DT, Visited, Depth + 1);
     }
 
-    // If no dominating store in the same BB, check if all stores in the function agree
-    PointerOrigin CommonOrigin = PointerOrigin::UNKNOWN;
-    bool First = true;
-    for (const StoreInst *SI : Stores) {
-        PointerOrigin StoredOrigin = tracePointerOrigin(SI->getValueOperand(), Visited, Depth + 1);
-        if (StoredOrigin == PointerOrigin::UNKNOWN) {
-            return PointerOrigin::UNKNOWN;
-        }
-        if (First) {
-            CommonOrigin = StoredOrigin;
-            First = false;
-        } else if (CommonOrigin != StoredOrigin) {
-            return PointerOrigin::UNKNOWN;
+    // 2. Inter-basic-block dominating store:
+    // If there is exactly ONE store to AI in the entire function and that store
+    // is proven by DominatorTree to dominate LI, it is guaranteed to reach LI.
+    if (Stores.size() == 1 && DT) {
+        const StoreInst *SingleStore = Stores[0];
+        if (DT->dominates(SingleStore, LI)) {
+            return tracePointerOrigin(SingleStore->getValueOperand(), DT, Visited, Depth + 1);
         }
     }
 
-    return CommonOrigin;
+    // If no store can be proven to dominate the load, return UNKNOWN conservatively.
+    return PointerOrigin::UNKNOWN;
 }
 
 /**
- * @brief Recursive pointer-origin tracing with cycle detection and depth limiting.
+ * @brief Recursive pointer-origin tracing with path-based cycle detection and depth limiting.
  */
 static PointerOrigin tracePointerOrigin(const Value *V,
+                                        const DominatorTree *DT,
                                         SmallPtrSetImpl<const Value *> &Visited,
                                         unsigned Depth) {
     if (!V) {
         return PointerOrigin::UNKNOWN;
     }
 
-    // Depth limit to prevent infinite recursion and overhead
+    // Depth limit to prevent long chains or analysis overhead
     if (Depth > MaxTraversalDepth) {
         return PointerOrigin::UNKNOWN;
     }
 
-    // Cycle detection using visited set
-    if (!Visited.insert(V).second) {
+    // Recursion-path-based cycle detection with RAII cleanup on scope exit
+    PathVisitedScope Scope(Visited, V);
+    if (Scope.isCycle()) {
         return PointerOrigin::UNKNOWN;
     }
 
@@ -207,30 +247,37 @@ static PointerOrigin tracePointerOrigin(const Value *V,
 
     // 7. GEP instructions: follow to source pointer operand
     if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) {
-        return tracePointerOrigin(GEP->getPointerOperand(), Visited, Depth + 1);
+        return tracePointerOrigin(GEP->getPointerOperand(), DT, Visited, Depth + 1);
     }
 
-    // 8. Pointer casts (BitCast, AddrSpaceCast, IntToPtr, PtrToInt)
+    // 8. Pointer casts: follow safe pointer-preserving casts only.
+    // Return UNKNOWN for PtrToInt, IntToPtr, or other unsafe conversions.
     if (auto *Cast = dyn_cast<CastInst>(V)) {
-        return tracePointerOrigin(Cast->getOperand(0), Visited, Depth + 1);
+        if (isa<BitCastInst>(Cast) || isa<AddrSpaceCastInst>(Cast)) {
+            return tracePointerOrigin(Cast->getOperand(0), DT, Visited, Depth + 1);
+        }
+        return PointerOrigin::UNKNOWN;
     }
 
     // 9. Freeze instructions
     if (auto *FI = dyn_cast<FreezeInst>(V)) {
-        return tracePointerOrigin(FI->getOperand(0), Visited, Depth + 1);
+        return tracePointerOrigin(FI->getOperand(0), DT, Visited, Depth + 1);
     }
 
-    // 10. Constant expressions (GEP or Cast)
+    // 10. Constant expressions (GEP or safe pointer casts)
     if (auto *CE = dyn_cast<ConstantExpr>(V)) {
-        if (CE->getOpcode() == Instruction::GetElementPtr || CE->isCast()) {
-            return tracePointerOrigin(CE->getOperand(0), Visited, Depth + 1);
+        if (CE->getOpcode() == Instruction::GetElementPtr ||
+            CE->getOpcode() == Instruction::BitCast ||
+            CE->getOpcode() == Instruction::AddrSpaceCast) {
+            return tracePointerOrigin(CE->getOperand(0), DT, Visited, Depth + 1);
         }
+        return PointerOrigin::UNKNOWN;
     }
 
     // 11. Select instructions: evaluate both arms
     if (auto *SI = dyn_cast<SelectInst>(V)) {
-        PointerOrigin TrueOrigin = tracePointerOrigin(SI->getTrueValue(), Visited, Depth + 1);
-        PointerOrigin FalseOrigin = tracePointerOrigin(SI->getFalseValue(), Visited, Depth + 1);
+        PointerOrigin TrueOrigin = tracePointerOrigin(SI->getTrueValue(), DT, Visited, Depth + 1);
+        PointerOrigin FalseOrigin = tracePointerOrigin(SI->getFalseValue(), DT, Visited, Depth + 1);
         if (TrueOrigin == FalseOrigin && TrueOrigin != PointerOrigin::UNKNOWN) {
             return TrueOrigin;
         }
@@ -245,7 +292,7 @@ static PointerOrigin tracePointerOrigin(const Value *V,
         PointerOrigin CommonOrigin = PointerOrigin::UNKNOWN;
         bool First = true;
         for (const Value *Incoming : PN->incoming_values()) {
-            PointerOrigin IncomingOrigin = tracePointerOrigin(Incoming, Visited, Depth + 1);
+            PointerOrigin IncomingOrigin = tracePointerOrigin(Incoming, DT, Visited, Depth + 1);
             if (IncomingOrigin == PointerOrigin::UNKNOWN) {
                 return PointerOrigin::UNKNOWN;
             }
@@ -259,11 +306,11 @@ static PointerOrigin tracePointerOrigin(const Value *V,
         return CommonOrigin;
     }
 
-    // 13. Load instructions: conservative local memory tracking
+    // 13. Load instructions: conservative local memory tracking with proven dominance
     if (auto *LI = dyn_cast<LoadInst>(V)) {
         const Value *LoadSource = LI->getPointerOperand();
         if (auto *AI = dyn_cast<AllocaInst>(LoadSource)) {
-            return traceAllocaOrigin(AI, LI, Visited, Depth + 1);
+            return traceAllocaOrigin(AI, LI, DT, Visited, Depth + 1);
         }
         return PointerOrigin::UNKNOWN;
     }
@@ -274,9 +321,9 @@ static PointerOrigin tracePointerOrigin(const Value *V,
 /**
  * @brief Public helper to classify a pointer's origin.
  */
-static PointerOrigin classifyPointerOrigin(const Value *V) {
+static PointerOrigin classifyPointerOrigin(const Value *V, const DominatorTree *DT) {
     SmallPtrSet<const Value *, 16> Visited;
-    return tracePointerOrigin(V, Visited, 0);
+    return tracePointerOrigin(V, DT, Visited, 0);
 }
 
 /**
@@ -288,7 +335,7 @@ static PointerOrigin classifyPointerOrigin(const Value *V) {
  */
 class MemoryGuardPass : public PassInfoMixin<MemoryGuardPass> {
 public:
-    PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
+    PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
         if (F.isDeclaration()) {
             return PreservedAnalyses::all();
         }
@@ -296,6 +343,7 @@ public:
         errs() << "MemoryGuard: analyzing function " << F.getName() << "\n";
 
         const DataLayout &DL = F.getParent()->getDataLayout();
+        DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
 
         for (BasicBlock &BB : F) {
             for (Instruction &I : BB) {
@@ -305,7 +353,7 @@ public:
                     Value *Ptr = LI->getPointerOperand();
                     Type *AccessedType = LI->getType();
                     TypeSize StoreSize = DL.getTypeStoreSize(AccessedType);
-                    PointerOrigin Origin = classifyPointerOrigin(Ptr);
+                    PointerOrigin Origin = classifyPointerOrigin(Ptr, &DT);
 
                     errs() << "  [READ]  function=" << F.getName()
                            << " type=";
@@ -323,7 +371,7 @@ public:
                     Value *Ptr = SI->getPointerOperand();
                     Type *StoredType = SI->getValueOperand()->getType();
                     TypeSize StoreSize = DL.getTypeStoreSize(StoredType);
-                    PointerOrigin Origin = classifyPointerOrigin(Ptr);
+                    PointerOrigin Origin = classifyPointerOrigin(Ptr, &DT);
 
                     errs() << "  [WRITE] function=" << F.getName()
                            << " type=";
@@ -359,8 +407,8 @@ private:
             return;
         }
 
-        // Avoid false positives from unusual calling conventions
-        if (Callee->getCallingConv() != CallingConv::C && CB->getCallingConv() != CallingConv::C) {
+        // Require both the callsite and the called function to use the C calling convention
+        if (Callee->getCallingConv() != CallingConv::C || CB->getCallingConv() != CallingConv::C) {
             return;
         }
 
