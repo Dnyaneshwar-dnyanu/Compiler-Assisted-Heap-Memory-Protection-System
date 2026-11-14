@@ -1,3 +1,4 @@
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -17,6 +18,7 @@
 #include "llvm/Support/TypeSize.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <memory>
 
 using namespace llvm;
 
@@ -80,6 +82,43 @@ static bool isHeapAllocCall(const Value *V) {
 }
 
 /**
+ * @brief Checks if a function belongs to the MemoryGuard runtime.
+ *
+ * Calls within MemoryGuard runtime functions must not be rewritten or instrumented
+ * to prevent infinite recursion. Matches exact runtime API names to avoid excluding
+ * unrelated application functions beginning with "mg_".
+ */
+static bool isMemoryGuardRuntimeFunction(const Function &F) {
+    StringRef Name = F.getName();
+    return Name == "mg_malloc" ||
+           Name == "mg_free" ||
+           Name == "mg_is_tracked" ||
+           Name == "mg_get_allocation_size" ||
+           Name == "mg_get_tracked_count" ||
+           Name == "mg_is_valid_access" ||
+           Name == "mg_check_access" ||
+           Name == "mg_register_external" ||
+           Name == "mg_unregister_external" ||
+           Name == "mg_realloc_external" ||
+           Name == "mg_intercept_malloc" ||
+           Name == "mg_intercept_calloc" ||
+           Name == "mg_intercept_realloc" ||
+           Name == "mg_intercept_free";
+}
+
+/**
+ * @brief Analysis context for interprocedural pointer-origin classification.
+ *
+ * Holds memoized argument classifications and cached DominatorTrees for callers
+ * to avoid duplicate call-site traversals and dominator recalculations.
+ */
+struct InterproceduralContext {
+    DenseMap<const Argument *, PointerOrigin> ArgCache;
+    DenseMap<const Function *, std::unique_ptr<DominatorTree>> DTCache;
+    const DominatorTree *CurrentDT = nullptr;
+};
+
+/**
  * @brief RAII helper for recursion-path-based cycle detection.
  *
  * Adds the value to the visited set upon entry and removes it upon scope exit,
@@ -110,13 +149,142 @@ public:
     }
 };
 
-// Forward declaration
+// Forward declarations
+static constexpr unsigned MaxTraversalDepth = 32;
+
 static PointerOrigin tracePointerOrigin(const Value *V,
                                         const DominatorTree *DT,
                                         SmallPtrSetImpl<const Value *> &Visited,
-                                        unsigned Depth);
+                                        unsigned Depth,
+                                        InterproceduralContext &ICtx);
 
-static constexpr unsigned MaxTraversalDepth = 8;
+/**
+ * @brief Interprocedural pointer-origin analysis for function parameters.
+ *
+ * Examines all direct call sites of the enclosing function:
+ *  - Requires the function to have local linkage (static in C) and address not taken,
+ *    ensuring all callers in the program reside within the current LLVM module.
+ *  - Requires all call sites to establish the same non-UNKNOWN origin (e.g. HEAP_CANDIDATE).
+ *  - If call-site information is incomplete, mixed, recursive, or ambiguous,
+ *    conservatively returns UNKNOWN.
+ */
+static PointerOrigin traceArgumentOrigin(const Argument *Arg,
+                                         SmallPtrSetImpl<const Value *> &Visited,
+                                         unsigned Depth,
+                                         InterproceduralContext &ICtx) {
+    if (!Arg || !Arg->getType()->isPointerTy()) {
+        return PointerOrigin::UNKNOWN;
+    }
+
+    // Check memoization cache first
+    auto CacheIt = ICtx.ArgCache.find(Arg);
+    if (CacheIt != ICtx.ArgCache.end()) {
+        return CacheIt->second;
+    }
+
+    const Function *F = Arg->getParent();
+    if (!F || F->isDeclaration()) {
+        return PointerOrigin::UNKNOWN;
+    }
+
+    // 1. Must have local linkage to guarantee all possible callers are within this module.
+    if (!F->hasLocalLinkage()) {
+        ICtx.ArgCache[Arg] = PointerOrigin::UNKNOWN;
+        return PointerOrigin::UNKNOWN;
+    }
+
+    // 2. Function address must not be taken (cannot be called indirectly).
+    if (F->hasAddressTaken()) {
+        ICtx.ArgCache[Arg] = PointerOrigin::UNKNOWN;
+        return PointerOrigin::UNKNOWN;
+    }
+
+    // 3. Must have at least one caller in the module.
+    if (F->use_empty()) {
+        ICtx.ArgCache[Arg] = PointerOrigin::UNKNOWN;
+        return PointerOrigin::UNKNOWN;
+    }
+
+    unsigned ArgNo = Arg->getArgNo();
+    PointerOrigin CommonOrigin = PointerOrigin::UNKNOWN;
+    bool FirstCallSite = true;
+
+    // 4. Examine all call sites of F in the module
+    for (const Use &U : F->uses()) {
+        const User *UserObj = U.getUser();
+        auto *CB = dyn_cast<CallBase>(UserObj);
+        if (!CB) {
+            // Function is used in something other than a direct call instruction
+            ICtx.ArgCache[Arg] = PointerOrigin::UNKNOWN;
+            return PointerOrigin::UNKNOWN;
+        }
+
+        // Verify F is the called callee, not an argument to another call
+        if (!CB->isCallee(&U)) {
+            ICtx.ArgCache[Arg] = PointerOrigin::UNKNOWN;
+            return PointerOrigin::UNKNOWN;
+        }
+
+        // Argument index must be within range of call site operands
+        if (ArgNo >= CB->arg_size()) {
+            ICtx.ArgCache[Arg] = PointerOrigin::UNKNOWN;
+            return PointerOrigin::UNKNOWN;
+        }
+
+        Value *ActualArg = CB->getArgOperand(ArgNo);
+        if (!ActualArg || !ActualArg->getType()->isPointerTy()) {
+            ICtx.ArgCache[Arg] = PointerOrigin::UNKNOWN;
+            return PointerOrigin::UNKNOWN;
+        }
+
+        const Function *Caller = CB->getFunction();
+        if (!Caller || Caller->isDeclaration()) {
+            ICtx.ArgCache[Arg] = PointerOrigin::UNKNOWN;
+            return PointerOrigin::UNKNOWN;
+        }
+
+        if (isMemoryGuardRuntimeFunction(*Caller)) {
+            ICtx.ArgCache[Arg] = PointerOrigin::UNKNOWN;
+            return PointerOrigin::UNKNOWN;
+        }
+
+        // Obtain or compute the DominatorTree for Caller
+        const DominatorTree *CallerDT = nullptr;
+        if (ICtx.CurrentDT && ICtx.CurrentDT->getRoot() &&
+            ICtx.CurrentDT->getRoot()->getParent() == Caller) {
+            CallerDT = ICtx.CurrentDT;
+        } else {
+            auto DtIt = ICtx.DTCache.find(Caller);
+            if (DtIt != ICtx.DTCache.end()) {
+                CallerDT = DtIt->second.get();
+            } else {
+                auto NewDT = std::make_unique<DominatorTree>(const_cast<Function &>(*Caller));
+                CallerDT = NewDT.get();
+                ICtx.DTCache[Caller] = std::move(NewDT);
+            }
+        }
+
+        // Trace the origin of ActualArg in the caller's context
+        PointerOrigin ActualOrigin = tracePointerOrigin(ActualArg, CallerDT, Visited, Depth + 1, ICtx);
+
+        if (ActualOrigin == PointerOrigin::UNKNOWN) {
+            ICtx.ArgCache[Arg] = PointerOrigin::UNKNOWN;
+            return PointerOrigin::UNKNOWN;
+        }
+
+        if (FirstCallSite) {
+            CommonOrigin = ActualOrigin;
+            FirstCallSite = false;
+        } else if (CommonOrigin != ActualOrigin) {
+            // Inconsistent origins across call sites (e.g. heap vs non-heap)
+            ICtx.ArgCache[Arg] = PointerOrigin::UNKNOWN;
+            return PointerOrigin::UNKNOWN;
+        }
+    }
+
+    ICtx.ArgCache[Arg] = CommonOrigin;
+    return CommonOrigin;
+}
 
 /**
  * @brief Conservatively analyzes pointer values loaded from local memory (alloca).
@@ -132,7 +300,8 @@ static constexpr unsigned MaxTraversalDepth = 8;
 static PointerOrigin traceAllocaOrigin(const AllocaInst *AI, const LoadInst *LI,
                                        const DominatorTree *DT,
                                        SmallPtrSetImpl<const Value *> &Visited,
-                                       unsigned Depth) {
+                                       unsigned Depth,
+                                       InterproceduralContext &ICtx) {
     // Collect all stores to AI and check if AI's address escapes
     SmallVector<const StoreInst *, 4> Stores;
     for (const User *U : AI->users()) {
@@ -178,7 +347,7 @@ static PointerOrigin traceAllocaOrigin(const AllocaInst *AI, const LoadInst *LI,
     }
 
     if (LocalDominatingStore) {
-        return tracePointerOrigin(LocalDominatingStore->getValueOperand(), DT, Visited, Depth + 1);
+        return tracePointerOrigin(LocalDominatingStore->getValueOperand(), DT, Visited, Depth + 1, ICtx);
     }
 
     // 2. Inter-basic-block dominating store:
@@ -187,7 +356,7 @@ static PointerOrigin traceAllocaOrigin(const AllocaInst *AI, const LoadInst *LI,
     if (Stores.size() == 1 && DT) {
         const StoreInst *SingleStore = Stores[0];
         if (DT->dominates(SingleStore, LI)) {
-            return tracePointerOrigin(SingleStore->getValueOperand(), DT, Visited, Depth + 1);
+            return tracePointerOrigin(SingleStore->getValueOperand(), DT, Visited, Depth + 1, ICtx);
         }
     }
 
@@ -201,7 +370,8 @@ static PointerOrigin traceAllocaOrigin(const AllocaInst *AI, const LoadInst *LI,
 static PointerOrigin tracePointerOrigin(const Value *V,
                                         const DominatorTree *DT,
                                         SmallPtrSetImpl<const Value *> &Visited,
-                                        unsigned Depth) {
+                                        unsigned Depth,
+                                        InterproceduralContext &ICtx) {
     if (!V) {
         return PointerOrigin::UNKNOWN;
     }
@@ -242,28 +412,28 @@ static PointerOrigin tracePointerOrigin(const Value *V,
         return PointerOrigin::UNKNOWN;
     }
 
-    // 6. Function arguments (unknown origin without interprocedural analysis)
-    if (isa<Argument>(V)) {
-        return PointerOrigin::UNKNOWN;
+    // 6. Function arguments: interprocedural call-site origin analysis
+    if (auto *Arg = dyn_cast<Argument>(V)) {
+        return traceArgumentOrigin(Arg, Visited, Depth, ICtx);
     }
 
     // 7. GEP instructions: follow to source pointer operand
     if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) {
-        return tracePointerOrigin(GEP->getPointerOperand(), DT, Visited, Depth + 1);
+        return tracePointerOrigin(GEP->getPointerOperand(), DT, Visited, Depth + 1, ICtx);
     }
 
     // 8. Pointer casts: follow safe pointer-preserving casts only.
     // Return UNKNOWN for PtrToInt, IntToPtr, or other unsafe conversions.
     if (auto *Cast = dyn_cast<CastInst>(V)) {
         if (isa<BitCastInst>(Cast) || isa<AddrSpaceCastInst>(Cast)) {
-            return tracePointerOrigin(Cast->getOperand(0), DT, Visited, Depth + 1);
+            return tracePointerOrigin(Cast->getOperand(0), DT, Visited, Depth + 1, ICtx);
         }
         return PointerOrigin::UNKNOWN;
     }
 
     // 9. Freeze instructions
     if (auto *FI = dyn_cast<FreezeInst>(V)) {
-        return tracePointerOrigin(FI->getOperand(0), DT, Visited, Depth + 1);
+        return tracePointerOrigin(FI->getOperand(0), DT, Visited, Depth + 1, ICtx);
     }
 
     // 10. Constant expressions (GEP or safe pointer casts)
@@ -271,15 +441,15 @@ static PointerOrigin tracePointerOrigin(const Value *V,
         if (CE->getOpcode() == Instruction::GetElementPtr ||
             CE->getOpcode() == Instruction::BitCast ||
             CE->getOpcode() == Instruction::AddrSpaceCast) {
-            return tracePointerOrigin(CE->getOperand(0), DT, Visited, Depth + 1);
+            return tracePointerOrigin(CE->getOperand(0), DT, Visited, Depth + 1, ICtx);
         }
         return PointerOrigin::UNKNOWN;
     }
 
     // 11. Select instructions: evaluate both arms
     if (auto *SI = dyn_cast<SelectInst>(V)) {
-        PointerOrigin TrueOrigin = tracePointerOrigin(SI->getTrueValue(), DT, Visited, Depth + 1);
-        PointerOrigin FalseOrigin = tracePointerOrigin(SI->getFalseValue(), DT, Visited, Depth + 1);
+        PointerOrigin TrueOrigin = tracePointerOrigin(SI->getTrueValue(), DT, Visited, Depth + 1, ICtx);
+        PointerOrigin FalseOrigin = tracePointerOrigin(SI->getFalseValue(), DT, Visited, Depth + 1, ICtx);
         if (TrueOrigin == FalseOrigin && TrueOrigin != PointerOrigin::UNKNOWN) {
             return TrueOrigin;
         }
@@ -294,7 +464,7 @@ static PointerOrigin tracePointerOrigin(const Value *V,
         PointerOrigin CommonOrigin = PointerOrigin::UNKNOWN;
         bool First = true;
         for (const Value *Incoming : PN->incoming_values()) {
-            PointerOrigin IncomingOrigin = tracePointerOrigin(Incoming, DT, Visited, Depth + 1);
+            PointerOrigin IncomingOrigin = tracePointerOrigin(Incoming, DT, Visited, Depth + 1, ICtx);
             if (IncomingOrigin == PointerOrigin::UNKNOWN) {
                 return PointerOrigin::UNKNOWN;
             }
@@ -312,7 +482,7 @@ static PointerOrigin tracePointerOrigin(const Value *V,
     if (auto *LI = dyn_cast<LoadInst>(V)) {
         const Value *LoadSource = LI->getPointerOperand();
         if (auto *AI = dyn_cast<AllocaInst>(LoadSource)) {
-            return traceAllocaOrigin(AI, LI, DT, Visited, Depth + 1);
+            return traceAllocaOrigin(AI, LI, DT, Visited, Depth + 1, ICtx);
         }
         return PointerOrigin::UNKNOWN;
     }
@@ -321,11 +491,23 @@ static PointerOrigin tracePointerOrigin(const Value *V,
 }
 
 /**
+ * @brief Public helper to classify a pointer's origin using interprocedural analysis context.
+ */
+static PointerOrigin classifyPointerOrigin(const Value *V,
+                                           const DominatorTree *DT,
+                                           InterproceduralContext &ICtx) {
+    SmallPtrSet<const Value *, 16> Visited;
+    return tracePointerOrigin(V, DT, Visited, 0, ICtx);
+}
+
+/**
  * @brief Public helper to classify a pointer's origin.
  */
-static PointerOrigin classifyPointerOrigin(const Value *V, const DominatorTree *DT) {
+[[maybe_unused]] static PointerOrigin classifyPointerOrigin(const Value *V, const DominatorTree *DT) {
+    InterproceduralContext ICtx;
+    ICtx.CurrentDT = DT;
     SmallPtrSet<const Value *, 16> Visited;
-    return tracePointerOrigin(V, DT, Visited, 0);
+    return tracePointerOrigin(V, DT, Visited, 0, ICtx);
 }
 
 /**
@@ -372,31 +554,6 @@ static FunctionCallee getOrInsertInterceptFree(Module &M) {
     Type *PtrTy = PointerType::getUnqual(Ctx);
     FunctionType *FTy = FunctionType::get(VoidTy, {PtrTy}, false);
     return M.getOrInsertFunction("mg_intercept_free", FTy);
-}
-
-/**
- * @brief Checks if a function belongs to the MemoryGuard runtime.
- *
- * Calls within MemoryGuard runtime functions must not be rewritten or instrumented
- * to prevent infinite recursion. Matches exact runtime API names to avoid excluding
- * unrelated application functions beginning with "mg_".
- */
-static bool isMemoryGuardRuntimeFunction(const Function &F) {
-    StringRef Name = F.getName();
-    return Name == "mg_malloc" ||
-           Name == "mg_free" ||
-           Name == "mg_is_tracked" ||
-           Name == "mg_get_allocation_size" ||
-           Name == "mg_get_tracked_count" ||
-           Name == "mg_is_valid_access" ||
-           Name == "mg_check_access" ||
-           Name == "mg_register_external" ||
-           Name == "mg_unregister_external" ||
-           Name == "mg_realloc_external" ||
-           Name == "mg_intercept_malloc" ||
-           Name == "mg_intercept_calloc" ||
-           Name == "mg_intercept_realloc" ||
-           Name == "mg_intercept_free";
 }
 
 /**
@@ -511,6 +668,9 @@ public:
         DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
         Module *M = F.getParent();
 
+        InterproceduralContext ICtx;
+        ICtx.CurrentDT = &DT;
+
         enum class RewriteKind { MALLOC, CALLOC, REALLOC, FREE };
         struct CallRewriteSite {
             CallBase *CB;
@@ -542,7 +702,7 @@ public:
                     Value *Ptr = LI->getPointerOperand();
                     Type *AccessedType = LI->getType();
                     TypeSize StoreSize = DL.getTypeStoreSize(AccessedType);
-                    PointerOrigin Origin = classifyPointerOrigin(Ptr, &DT);
+                    PointerOrigin Origin = classifyPointerOrigin(Ptr, &DT, ICtx);
 
                     errs() << "  [READ]  function=" << F.getName()
                            << " type=";
@@ -572,7 +732,7 @@ public:
                     Value *Ptr = SI->getPointerOperand();
                     Type *StoredType = SI->getValueOperand()->getType();
                     TypeSize StoreSize = DL.getTypeStoreSize(StoredType);
-                    PointerOrigin Origin = classifyPointerOrigin(Ptr, &DT);
+                    PointerOrigin Origin = classifyPointerOrigin(Ptr, &DT, ICtx);
 
                     errs() << "  [WRITE] function=" << F.getName()
                            << " type=";

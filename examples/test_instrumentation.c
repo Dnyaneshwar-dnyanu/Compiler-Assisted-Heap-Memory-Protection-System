@@ -171,6 +171,159 @@ void mg_process_packet_oob(void) {
     exit(0);
 }
 
+/* =========================================================================
+ * Step 11: Interprocedural Pointer-Origin Integration Tests
+ * ========================================================================= */
+
+/* Scenario 1: Heap pointer passed to a function */
+static void callee_heap_access(int *p) {
+    p[0] = 55;
+    p[7] = 77;
+}
+
+static int callee_heap_read(int *p) {
+    return p[0] + p[7];
+}
+
+static void callee_heap_oob(int *p) {
+    p[8] = 999; /* Out of bounds on 32-byte alloc: MUST abort! */
+}
+
+void test_fn_interproc_heap_param(void) {
+    int *p = (int *)malloc(32); /* 8 ints */
+    if (!p) exit(1);
+    callee_heap_access(p);
+    int sum = callee_heap_read(p);
+    if (sum != 132) exit(1);
+    free(p);
+    exit(0);
+}
+
+void test_fn_interproc_heap_oob(void) {
+    int *p = (int *)malloc(32);
+    if (!p) exit(1);
+    callee_heap_oob(p);
+    free(p);
+    exit(0);
+}
+
+/* Scenario 2: Multiple functions forwarding a heap pointer */
+static void deep_sink_write(int *p) {
+    p[2] = 222;
+}
+
+static void intermediate_forwarder(int *p) {
+    deep_sink_write(p);
+}
+
+static void deep_sink_oob(int *p) {
+    p[15] = 999; /* Out of bounds: MUST abort! */
+}
+
+static void intermediate_forwarder_oob(int *p) {
+    deep_sink_oob(p);
+}
+
+void test_fn_interproc_forwarding(void) {
+    int *p = (int *)malloc(32);
+    if (!p) exit(1);
+    intermediate_forwarder(p);
+    if (p[2] != 222) exit(1);
+    free(p);
+    exit(0);
+}
+
+void test_fn_interproc_forwarding_oob(void) {
+    int *p = (int *)malloc(32);
+    if (!p) exit(1);
+    intermediate_forwarder_oob(p);
+    free(p);
+    exit(0);
+}
+
+/* Scenario 3: Multiple direct call sites with heap pointers */
+static void multi_callsite_target(int *p, int val) {
+    p[0] = val;
+}
+
+static void multi_callsite_oob_target(int *p) {
+    p[8] = 999;
+}
+
+void test_fn_interproc_multi_callsites(void) {
+    int *p1 = (int *)malloc(32);
+    int *p2 = (int *)malloc(64);
+    if (!p1 || !p2) exit(1);
+
+    multi_callsite_target(p1, 10);
+    multi_callsite_target(p2, 20);
+
+    if (p1[0] != 10 || p2[0] != 20) exit(1);
+
+    free(p1);
+    free(p2);
+    exit(0);
+}
+
+void test_fn_interproc_multi_callsites_oob(void) {
+    int *p1 = (int *)malloc(32);
+    int *p2 = (int *)malloc(64);
+    if (!p1 || !p2) exit(1);
+
+    multi_callsite_target(p1, 10);
+    multi_callsite_target(p2, 20);
+
+    /* Out of bounds access through multi_callsite_oob_target */
+    multi_callsite_oob_target(p1);
+
+    free(p1);
+    free(p2);
+    exit(0);
+}
+
+/* Scenario 4: Mixed heap and non-heap call sites (MUST remain uninstrumented) */
+static void mixed_arg_callee(int *p) {
+    p[0] = 100; /* Should NOT be instrumented because one caller passes stack */
+}
+
+void test_fn_interproc_mixed(void) {
+    int *heap_buf = (int *)malloc(32);
+    if (!heap_buf) exit(1);
+    mixed_arg_callee(heap_buf);
+    free(heap_buf);
+
+    int stack_var = 0;
+    mixed_arg_callee(&stack_var);
+    if (stack_var != 100) exit(1);
+
+    exit(0);
+}
+
+/* Scenario 5: Function with externally visible callers (MUST remain uninstrumented) */
+void external_callee_fn(int *p) {
+    p[0] = 300; /* Must NOT be instrumented! */
+}
+
+void test_fn_interproc_external_caller(void) {
+    int stack_val = 0;
+    external_callee_fn(&stack_val);
+    if (stack_val != 300) exit(1);
+    exit(0);
+}
+
+/* Scenario 6: Recursive call pattern handled conservatively (MUST remain uninstrumented) */
+static int recursive_countdown(int *p, int count) {
+    if (count <= 0) return 0;
+    return p[0] + recursive_countdown(p, count - 1);
+}
+
+void test_fn_interproc_recursive(void) {
+    int stack_val = 5;
+    int res = recursive_countdown(&stack_val, 3);
+    if (res != 15) exit(1);
+    exit(0);
+}
+
 static int run_in_child(void (*fn)(void)) {
     fflush(stdout);
     fflush(stderr);
@@ -310,6 +463,87 @@ int main(void) {
         passed++;
     } else {
         printf("  [FAIL] mg_process_packet_oob was NOT caught (status: %d).\n", st10);
+    }
+
+    /* 11. Interprocedural: Heap pointer passed to a function -> must exit 0 */
+    total++;
+    printf("[TEST] Interprocedural heap parameter valid access...\n");
+    int st11 = run_in_child(test_fn_interproc_heap_param);
+    if (WIFEXITED(st11) && WEXITSTATUS(st11) == 0) {
+        printf("  [PASS] Interprocedural heap parameter access validated and completed normally.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Interprocedural heap parameter test failed (status: %d).\n", st11);
+    }
+
+    /* 12. Interprocedural: Heap pointer passed to a function OOB -> must abort with SIGABRT */
+    total++;
+    printf("[TEST] Interprocedural heap parameter out-of-bounds access...\n");
+    int st12 = run_in_child(test_fn_interproc_heap_oob);
+    if (WIFSIGNALED(st12) && WTERMSIG(st12) == SIGABRT) {
+        printf("  [PASS] Interprocedural out-of-bounds access caught and aborted by MemoryGuard.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Interprocedural OOB access was NOT caught (status: %d).\n", st12);
+    }
+
+    /* 13. Interprocedural: Forwarding heap pointer across multiple functions -> must exit 0 */
+    total++;
+    printf("[TEST] Interprocedural multi-function forwarding valid access...\n");
+    int st13 = run_in_child(test_fn_interproc_forwarding);
+    if (WIFEXITED(st13) && WEXITSTATUS(st13) == 0) {
+        printf("  [PASS] Multi-function forwarding access validated and completed normally.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Multi-function forwarding test failed (status: %d).\n", st13);
+    }
+
+    /* 14. Interprocedural: Forwarding heap pointer OOB -> must abort with SIGABRT */
+    total++;
+    printf("[TEST] Interprocedural multi-function forwarding out-of-bounds access...\n");
+    int st14 = run_in_child(test_fn_interproc_forwarding_oob);
+    if (WIFSIGNALED(st14) && WTERMSIG(st14) == SIGABRT) {
+        printf("  [PASS] Multi-function forwarding out-of-bounds caught and aborted.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Multi-function forwarding OOB was NOT caught (status: %d).\n", st14);
+    }
+
+    /* 15. Interprocedural: Multiple direct call sites with heap pointers -> must exit 0 and abort on OOB */
+    total++;
+    printf("[TEST] Interprocedural multiple direct call sites...\n");
+    int st15 = run_in_child(test_fn_interproc_multi_callsites);
+    int st15_oob = run_in_child(test_fn_interproc_multi_callsites_oob);
+    if (WIFEXITED(st15) && WEXITSTATUS(st15) == 0 &&
+        WIFSIGNALED(st15_oob) && WTERMSIG(st15_oob) == SIGABRT) {
+        printf("  [PASS] Multiple direct call sites validated and OOB aborted correctly.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Multiple direct call sites failed (st15: %d, st15_oob: %d).\n", st15, st15_oob);
+    }
+
+    /* 16. Interprocedural: Mixed heap and non-heap call sites -> must remain UNINSTRUMENTED and exit 0 */
+    total++;
+    printf("[TEST] Interprocedural mixed heap/non-heap call sites (uninstrumented)...\n");
+    int st16 = run_in_child(test_fn_interproc_mixed);
+    if (WIFEXITED(st16) && WEXITSTATUS(st16) == 0) {
+        printf("  [PASS] Mixed call sites remained uninstrumented and executed normally.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Mixed call sites failed (status: %d).\n", st16);
+    }
+
+    /* 17. Interprocedural: Externally visible and recursive call patterns -> must remain UNINSTRUMENTED */
+    total++;
+    printf("[TEST] Interprocedural external/recursive call patterns (uninstrumented)...\n");
+    int st17_ext = run_in_child(test_fn_interproc_external_caller);
+    int st17_rec = run_in_child(test_fn_interproc_recursive);
+    if (WIFEXITED(st17_ext) && WEXITSTATUS(st17_ext) == 0 &&
+        WIFEXITED(st17_rec) && WEXITSTATUS(st17_rec) == 0) {
+        printf("  [PASS] External and recursive functions remained uninstrumented and executed normally.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] External/recursive functions failed (ext: %d, rec: %d).\n", st17_ext, st17_rec);
     }
 
     printf("====================================================\n");
