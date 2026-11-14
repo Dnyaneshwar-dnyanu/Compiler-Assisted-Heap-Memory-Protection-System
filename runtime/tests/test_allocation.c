@@ -4,6 +4,18 @@
 #include <string.h>
 #include <stdint.h>
 
+#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
+/**
+ * @brief Provide default AddressSanitizer options.
+ *
+ * Setting allocator_may_return_null=1 ensures realloc/malloc return NULL on
+ * extreme sizes (such as SIZE_MAX in failure tests) rather than aborting.
+ */
+const char *__asan_default_options(void) {
+    return "allocator_may_return_null=1";
+}
+#endif
+
 static int total_assertions = 0;
 static int failed_assertions = 0;
 
@@ -285,6 +297,176 @@ static void test_boundary_validation(void) {
     TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count restored to initial after freeing buf");
 }
 
+/**
+ * @brief Tests external allocation support: registration, unregistration,
+ *        reallocation, failure handling, and boundary checks.
+ */
+static void test_external_allocations(void) {
+    size_t initial_count = mg_get_tracked_count();
+
+    /* 1. Register a standard malloc allocation */
+    size_t ext_size = 120;
+    void *ext_p = malloc(ext_size);
+    TEST_ASSERT(ext_p != NULL, "Standard malloc succeeded for external registration test");
+    TEST_ASSERT(mg_register_external(ext_p, ext_size) == 1, "mg_register_external succeeded");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Tracked count incremented after external registration");
+
+    /* 2. Verify mg_is_tracked and mg_get_allocation_size */
+    TEST_ASSERT(mg_is_tracked(ext_p) == 1, "External pointer is tracked");
+    TEST_ASSERT(mg_get_allocation_size(ext_p) == ext_size, "Recorded size matches external allocation size");
+
+    /* 3. Verify mg_is_valid_access works with external allocations */
+    char *c_ext = (char *)ext_p;
+    TEST_ASSERT(mg_is_valid_access(c_ext, 1) == 1, "Access 1 byte from base is valid");
+    TEST_ASSERT(mg_is_valid_access(c_ext, ext_size) == 1, "Access full external buffer from base is valid");
+    TEST_ASSERT(mg_is_valid_access(c_ext + 20, 50) == 1, "Access interior range is valid");
+    TEST_ASSERT(mg_is_valid_access(c_ext + 60, 60) == 1, "Access ending at boundary is valid");
+    TEST_ASSERT(mg_is_valid_access(c_ext, ext_size + 1) == 0, "Access exceeding boundary is rejected");
+    TEST_ASSERT(mg_is_valid_access(c_ext + 100, 21) == 0, "Access starting at offset 100 with size 21 is rejected");
+    TEST_ASSERT(mg_is_valid_access(c_ext, 0) == 1, "Zero-size access at base is valid");
+    TEST_ASSERT(mg_is_valid_access(c_ext + ext_size - 1, 0) == 1, "Zero-size access at last byte is valid");
+    TEST_ASSERT(mg_is_valid_access(c_ext + ext_size, 0) == 0, "Zero-size access at boundary one-past is rejected");
+
+    /* 4. Reject duplicate registration */
+    TEST_ASSERT(mg_register_external(ext_p, ext_size) == 0, "Duplicate registration with same size rejected");
+    TEST_ASSERT(mg_register_external(ext_p, 200) == 0, "Duplicate registration with different size rejected");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Tracked count unchanged after rejected duplicate registrations");
+
+    /* 5. Unregister external memory without freeing payload */
+    TEST_ASSERT(mg_unregister_external(ext_p) == 1, "mg_unregister_external succeeded");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count restored after unregistration");
+    TEST_ASSERT(mg_is_tracked(ext_p) == 0, "External pointer no longer tracked");
+    TEST_ASSERT(mg_get_allocation_size(ext_p) == 0, "Recorded size is 0 after unregistration");
+    TEST_ASSERT(mg_is_valid_access(ext_p, ext_size) == 0, "Access validation fails after unregistration");
+
+    /* Verify payload memory is still valid and writable by caller */
+    memset(ext_p, 0x55, ext_size);
+    int payload_intact = 1;
+    for (size_t i = 0; i < ext_size; i++) {
+        if (((unsigned char *)ext_p)[i] != 0x55) {
+            payload_intact = 0;
+            break;
+        }
+    }
+    TEST_ASSERT(payload_intact == 1, "External payload remained valid and writable after unregistration");
+    free(ext_p);
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count unchanged after caller freed payload");
+
+    /* 6. Registering an unknown or invalid pointer safely */
+    TEST_ASSERT(mg_register_external(NULL, 100) == 0, "Registering NULL is rejected");
+    TEST_ASSERT(mg_unregister_external(NULL) == 0, "Unregistering NULL returns 0");
+    int stack_var = 999;
+    TEST_ASSERT(mg_unregister_external(&stack_var) == 0, "Unregistering untracked stack pointer returns 0");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count unchanged after invalid operations");
+
+    /* Test zero-sized external allocation */
+    void *zero_p = malloc(0);
+    if (zero_p != NULL) {
+        TEST_ASSERT(mg_register_external(zero_p, 0) == 1, "Registering zero-sized external allocation succeeded");
+        TEST_ASSERT(mg_is_tracked(zero_p) == 1, "Zero-sized external allocation is tracked");
+        TEST_ASSERT(mg_get_allocation_size(zero_p) == 0, "Zero-sized external allocation size is 0");
+        TEST_ASSERT(mg_is_valid_access(zero_p, 0) == 0, "Zero-size access on zero-sized allocation is invalid");
+        TEST_ASSERT(mg_unregister_external(zero_p) == 1, "Unregistering zero-sized external allocation succeeded");
+        free(zero_p);
+    }
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count clean after zero-sized test");
+
+    /* 7. Reallocate a registered allocation successfully */
+    size_t orig_size = 64;
+    size_t new_size = 256;
+    void *orig_p = malloc(orig_size);
+    TEST_ASSERT(orig_p != NULL, "Allocated buffer for successful realloc test");
+    memset(orig_p, 0x42, orig_size);
+    TEST_ASSERT(mg_register_external(orig_p, orig_size) == 1, "Registered buffer before realloc");
+
+    void *realloc_p = mg_realloc_external(orig_p, new_size);
+    TEST_ASSERT(realloc_p != NULL, "mg_realloc_external succeeded");
+    TEST_ASSERT(mg_is_tracked(realloc_p) == 1, "Reallocated pointer is tracked in registry");
+    TEST_ASSERT(mg_get_allocation_size(realloc_p) == new_size, "Registry size updated to new_size");
+    TEST_ASSERT(mg_is_valid_access(realloc_p, new_size) == 1, "Full new range is valid access");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Registry count maintained as 1 allocation");
+
+    /* Verify original data preserved in reallocated block without using orig_p */
+    unsigned char *realloc_bytes = (unsigned char *)realloc_p;
+    int realloc_data_ok = 1;
+    for (size_t i = 0; i < orig_size; i++) {
+        if (realloc_bytes[i] != 0x42) {
+            realloc_data_ok = 0;
+            break;
+        }
+    }
+    TEST_ASSERT(realloc_data_ok == 1, "Original data preserved across successful realloc");
+    /* Write into expanded area */
+    memset(realloc_bytes + orig_size, 0x7E, new_size - orig_size);
+
+    /* Unregister and free the reallocated buffer */
+    TEST_ASSERT(mg_unregister_external(realloc_p) == 1, "Unregistered reallocated buffer");
+    free(realloc_p);
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count restored after freeing realloc_p");
+
+    /* 8. Reallocating with failure while preserving the original registry entry */
+    size_t fail_test_size = 80;
+    void *fail_p = malloc(fail_test_size);
+    TEST_ASSERT(fail_p != NULL, "Allocated buffer for failure realloc test");
+    memset(fail_p, 0xAB, fail_test_size);
+    TEST_ASSERT(mg_register_external(fail_p, fail_test_size) == 1, "Registered buffer for failure realloc test");
+
+    /* Requesting SIZE_MAX guarantees failure on any standard allocator */
+    void *fail_result = mg_realloc_external(fail_p, SIZE_MAX);
+    TEST_ASSERT(fail_result == NULL, "mg_realloc_external returned NULL on impossible allocation request");
+    TEST_ASSERT(mg_is_tracked(fail_p) == 1, "Original pointer is STILL tracked after realloc failure");
+    TEST_ASSERT(mg_get_allocation_size(fail_p) == fail_test_size, "Original size preserved in registry after realloc failure");
+    TEST_ASSERT(mg_is_valid_access(fail_p, fail_test_size) == 1, "Original boundary validation preserved after realloc failure");
+    TEST_ASSERT(((unsigned char *)fail_p)[0] == 0xAB, "Original buffer content intact after realloc failure");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Registry count unchanged after realloc failure");
+
+    /* Clean up failure test allocation */
+    TEST_ASSERT(mg_unregister_external(fail_p) == 1, "Unregistered failure test pointer");
+    free(fail_p);
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count restored after freeing fail_p");
+
+    /* 9. Reallocating an unregistered pointer without registering it */
+    void *unreg_p = malloc(32);
+    TEST_ASSERT(unreg_p != NULL, "Allocated unregistered pointer");
+    TEST_ASSERT(mg_is_tracked(unreg_p) == 0, "Pointer is initially untracked");
+
+    void *unreg_realloc = mg_realloc_external(unreg_p, 128);
+    TEST_ASSERT(unreg_realloc != NULL, "Reallocation of unregistered pointer succeeded");
+    TEST_ASSERT(mg_is_tracked(unreg_realloc) == 0, "Reallocated untracked pointer remains untracked");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count unchanged when reallocating unregistered pointer");
+    free(unreg_realloc);
+
+    /* Handling NULL input with mg_realloc_external */
+    void *null_realloc = mg_realloc_external(NULL, 64);
+    TEST_ASSERT(null_realloc != NULL, "mg_realloc_external(NULL, size) behaves like malloc");
+    TEST_ASSERT(mg_is_tracked(null_realloc) == 0, "Buffer from NULL realloc is not automatically registered");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count unchanged for NULL realloc");
+    free(null_realloc);
+
+    /* 10. Platform-specific realloc(ptr, 0) handling */
+    size_t zero_realloc_size = 48;
+    void *zero_target_p = malloc(zero_realloc_size);
+    TEST_ASSERT(zero_target_p != NULL, "Allocated buffer for realloc(ptr, 0) test");
+    TEST_ASSERT(mg_register_external(zero_target_p, zero_realloc_size) == 1, "Registered buffer for realloc(ptr, 0) test");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Registry count incremented before realloc(ptr, 0)");
+
+    void *zero_res = mg_realloc_external(zero_target_p, 0);
+    if (zero_res == NULL) {
+        /* Standard platform behavior (e.g. glibc): buffer was freed and NULL returned */
+        TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry entry removed when realloc(ptr, 0) returns NULL");
+        TEST_ASSERT(mg_is_tracked(zero_target_p) == 0, "Original pointer no longer tracked");
+    } else {
+        /* Platform returned a distinct non-dereferenceable zero-sized pointer */
+        TEST_ASSERT(mg_is_tracked(zero_res) == 1, "Zero-size realloc pointer is tracked");
+        TEST_ASSERT(mg_get_allocation_size(zero_res) == 0, "Zero-size realloc pointer size is 0");
+        TEST_ASSERT(mg_unregister_external(zero_res) == 1, "Unregistered zero-size pointer");
+        free(zero_res);
+        TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry restored to initial");
+    }
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Final registry count matches initial count");
+}
+
 int main(void) {
     printf("========================================\n");
     printf("  MemoryGuard Allocation Registry Tests \n");
@@ -297,6 +479,7 @@ int main(void) {
     RUN_TEST(test_tracking_after_deallocation);
     RUN_TEST(test_null_allocation_handling);
     RUN_TEST(test_boundary_validation);
+    RUN_TEST(test_external_allocations);
 
     printf("========================================\n");
     printf("Summary: %d assertions, %d failed\n", total_assertions, failed_assertions);

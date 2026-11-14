@@ -87,6 +87,62 @@ size_t mg_get_tracked_count(void);
  */
 int mg_is_valid_access(const void *ptr, size_t access_size);
 
+/**
+ * @brief Registers an external heap allocation with the MemoryGuard registry.
+ *
+ * Tracks an existing buffer allocated through standard C allocation functions
+ * (malloc, calloc, etc.) without transferring ownership of its memory to MemoryGuard.
+ * MemoryGuard will track this range for boundary checks and size queries, but will
+ * not free the payload memory upon unregistration.
+ *
+ * Rejects:
+ *  - NULL pointers (returns 0)
+ *  - Duplicate registrations of an already-tracked base address (returns 0)
+ *
+ * Supports zero-sized allocations (size == 0) consistently with mg_malloc(0).
+ *
+ * @param ptr Non-NULL base address of the external allocation.
+ * @param size Allocated size in bytes.
+ * @return int 1 on success, 0 on failure (e.g. ptr is NULL, duplicate base address,
+ *             or metadata allocation failure).
+ */
+int mg_register_external(void *ptr, size_t size);
+
+/**
+ * @brief Unregisters an external heap allocation from the MemoryGuard registry.
+ *
+ * Removes the metadata node from the registry without freeing the underlying payload.
+ * The application retains ownership of the payload and is responsible for freeing it.
+ *
+ * @param ptr Base address of the external allocation to unregister.
+ * @return int 1 on success, 0 if ptr is NULL or not found in the registry.
+ */
+int mg_unregister_external(void *ptr);
+
+/**
+ * @brief Reallocates an external allocation and updates the registry.
+ *
+ * Invokes standard C realloc internally.
+ *
+ * Behavior:
+ *  - If ptr is registered in MemoryGuard:
+ *      * On successful nonzero-size reallocation (new_size > 0), updates the existing
+ *        registry entry in-place with the new address and size. The old pointer is never
+ *        dereferenced or used again.
+ *      * On failure, preserves the original registry entry untouched because realloc
+ *        leaves the original allocation intact.
+ *      * If new_size == 0, follows platform-specific realloc(ptr, 0) behavior:
+ *        if non-null is returned, registry size updates to 0;
+ *        if NULL is returned (platform freed the buffer), the registry entry is removed.
+ *  - If ptr is not registered, or if ptr is NULL, performs standard realloc without
+ *    altering or registering the allocation in the registry.
+ *
+ * @param ptr Pointer previously allocated (may be NULL or unregistered).
+ * @param new_size Requested new size in bytes.
+ * @return void* Pointer to reallocated memory, or NULL on failure / deallocation.
+ */
+void *mg_realloc_external(void *ptr, size_t new_size);
+
 #ifdef __cplusplus
 }
 #endif

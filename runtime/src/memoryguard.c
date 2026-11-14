@@ -12,6 +12,7 @@
 typedef struct Allocation {
     void *address;              /**< Starting base address of the allocated memory */
     size_t size;                /**< Size of the allocated memory in bytes */
+    int owns_payload;           /**< 1 if allocated by mg_malloc, 0 if registered externally */
     struct Allocation *next;    /**< Pointer to the next metadata entry in the registry */
 } Allocation;
 
@@ -41,6 +42,7 @@ void *mg_malloc(size_t size) {
     /* Step 3: Populate metadata node fields */
     node->address = payload;
     node->size = size;
+    node->owns_payload = 1;
 
     /* Step 4: Register node by prepending it to the linked list */
     node->next = allocation_registry;
@@ -68,8 +70,10 @@ void mg_free(void *ptr) {
                 prev->next = curr->next;
             }
 
-            /* Release the underlying allocated memory */
-            free(curr->address);
+            /* Release the underlying allocated memory if owned by MemoryGuard */
+            if (curr->owns_payload) {
+                free(curr->address);
+            }
 
             /* Release the metadata node itself */
             free(curr);
@@ -171,4 +175,114 @@ int mg_is_valid_access(const void *ptr, size_t access_size) {
 
     /* Pointer/range is outside all tracked allocations */
     return 0;
+}
+
+int mg_register_external(void *ptr, size_t size) {
+    if (ptr == NULL) {
+        return 0;
+    }
+
+    /* Reject duplicate registration of the same base pointer */
+    if (mg_is_tracked(ptr)) {
+        return 0;
+    }
+
+    Allocation *node = (Allocation *)malloc(sizeof(Allocation));
+    if (node == NULL) {
+        return 0;
+    }
+
+    node->address = ptr;
+    node->size = size;
+    node->owns_payload = 0;
+
+    node->next = allocation_registry;
+    allocation_registry = node;
+
+    return 1;
+}
+
+int mg_unregister_external(void *ptr) {
+    if (ptr == NULL) {
+        return 0;
+    }
+
+    Allocation *curr = allocation_registry;
+    Allocation *prev = NULL;
+
+    while (curr != NULL) {
+        if (curr->address == ptr) {
+            /* Unlink node from the registry */
+            if (prev == NULL) {
+                allocation_registry = curr->next;
+            } else {
+                prev->next = curr->next;
+            }
+
+            /* Release only the metadata node; caller retains payload ownership */
+            free(curr);
+            return 1;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+
+    return 0; /* Pointer was not registered */
+}
+
+void *mg_realloc_external(void *ptr, size_t new_size) {
+    if (ptr == NULL) {
+        /* Standard realloc(NULL, size) allocates memory without registering it */
+        return realloc(NULL, new_size);
+    }
+
+    /* Find the registry entry for ptr BEFORE calling realloc */
+    Allocation *curr = allocation_registry;
+    Allocation *prev = NULL;
+    while (curr != NULL && curr->address != ptr) {
+        prev = curr;
+        curr = curr->next;
+    }
+
+    /* If ptr is not tracked by MemoryGuard, delegate directly to standard realloc */
+    if (curr == NULL) {
+        return realloc(ptr, new_size);
+    }
+
+    /* ptr is tracked in MemoryGuard */
+    if (new_size == 0) {
+        void *new_ptr = realloc(ptr, 0);
+        if (new_ptr != NULL) {
+            /* Platform returned a non-null zero-sized buffer */
+            curr->address = new_ptr;
+            curr->size = 0;
+            return new_ptr;
+        } else {
+            /* Platform deallocated the buffer and returned NULL */
+            if (prev == NULL) {
+                allocation_registry = curr->next;
+            } else {
+                prev->next = curr->next;
+            }
+            free(curr);
+            return NULL;
+        }
+    }
+
+    /* new_size > 0: call standard realloc */
+    void *new_ptr = realloc(ptr, new_size);
+    if (new_ptr == NULL) {
+        /* Reallocation failed. Standard realloc guarantees the original memory
+         * block at ptr remains allocated and intact.
+         * The original registry entry is preserved untouched without any modification. */
+        return NULL;
+    }
+
+    /* Reallocation succeeded.
+     * Update the existing registry node in-place with the new address and size.
+     * Note: 'ptr' is now invalidated if moved; we do not read or pass 'ptr'
+     * again, avoiding stale or dangling pointer bugs. */
+    curr->address = new_ptr;
+    curr->size = new_size;
+    return new_ptr;
 }
