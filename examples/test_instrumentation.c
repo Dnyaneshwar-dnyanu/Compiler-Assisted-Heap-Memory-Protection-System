@@ -324,6 +324,28 @@ void test_fn_interproc_recursive(void) {
     exit(0);
 }
 
+/* =========================================================================
+ * Step 12: Advanced Pointer-Origin Propagation Integration Tests
+ * ========================================================================= */
+
+/* ========================================================================= */
+/* Step 12: Aggregate operations and pointer-origin propagation               */
+/* ========================================================================= */
+
+extern void mg_test_aggregate_struct_valid(void);
+extern void mg_test_aggregate_struct_oob(void);
+extern void mg_test_aggregate_nested_valid(void);
+extern void mg_test_aggregate_nested_oob(void);
+extern void mg_test_aggregate_array_valid(void);
+extern void mg_test_aggregate_array_oob(void);
+extern void mg_test_aggregate_disjoint(void);
+extern void mg_test_aggregate_stack_non_heap(void);
+extern void mg_test_aggregate_interproc_valid(void);
+extern void mg_test_aggregate_interproc_oob(void);
+extern void mg_test_aggregate_mixed(void);
+extern void mg_test_pointer_cast_valid(void);
+extern void mg_test_pointer_cast_oob(void);
+
 static int run_in_child(void (*fn)(void)) {
     fflush(stdout);
     fflush(stderr);
@@ -347,7 +369,7 @@ static int run_in_child(void (*fn)(void)) {
 
 int main(void) {
     printf("====================================================\n");
-    printf(" MemoryGuard Step 9: Call-Site Rewriting Test Suite \n");
+    printf(" MemoryGuard Full Integration & Instrumentation Test\n");
     printf("====================================================\n");
 
     int total = 0;
@@ -544,6 +566,104 @@ int main(void) {
         passed++;
     } else {
         printf("  [FAIL] External/recursive functions failed (ext: %d, rec: %d).\n", st17_ext, st17_rec);
+    }
+
+    /* 18. Aggregate: Struct insertion and extraction */
+    total++;
+    printf("[TEST] Aggregate struct insertion and extraction (valid & OOB)...\n");
+    int st18_val = run_in_child(mg_test_aggregate_struct_valid);
+    int st18_oob = run_in_child(mg_test_aggregate_struct_oob);
+    if (WIFEXITED(st18_val) && WEXITSTATUS(st18_val) == 0 &&
+        WIFSIGNALED(st18_oob) && WTERMSIG(st18_oob) == SIGABRT) {
+        printf("  [PASS] Aggregate struct valid access passed and OOB aborted correctly.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Aggregate struct failed (val: %d, oob: %d).\n", st18_val, st18_oob);
+    }
+
+    /* 19. Aggregate: Nested aggregate struct */
+    total++;
+    printf("[TEST] Nested aggregate struct insertion and extraction (valid & OOB)...\n");
+    int st19_val = run_in_child(mg_test_aggregate_nested_valid);
+    int st19_oob = run_in_child(mg_test_aggregate_nested_oob);
+    if (WIFEXITED(st19_val) && WEXITSTATUS(st19_val) == 0 &&
+        WIFSIGNALED(st19_oob) && WTERMSIG(st19_oob) == SIGABRT) {
+        printf("  [PASS] Nested aggregate valid access passed and OOB aborted correctly.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Nested aggregate failed (val: %d, oob: %d).\n", st19_val, st19_oob);
+    }
+
+    /* 20. Aggregate: Aggregate containing array of pointers */
+    total++;
+    printf("[TEST] Aggregate containing array of pointers (valid & OOB)...\n");
+    int st20_val = run_in_child(mg_test_aggregate_array_valid);
+    int st20_oob = run_in_child(mg_test_aggregate_array_oob);
+    if (WIFEXITED(st20_val) && WEXITSTATUS(st20_val) == 0 &&
+        WIFSIGNALED(st20_oob) && WTERMSIG(st20_oob) == SIGABRT) {
+        printf("  [PASS] Aggregate array valid access passed and OOB aborted correctly.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Aggregate array failed (val: %d, oob: %d).\n", st20_val, st20_oob);
+    }
+
+    /* 21. Aggregate: Disjoint index insertion and extraction */
+    total++;
+    printf("[TEST] Aggregate disjoint index propagation...\n");
+    int st21 = run_in_child(mg_test_aggregate_disjoint);
+    if (WIFEXITED(st21) && WEXITSTATUS(st21) == 0) {
+        printf("  [PASS] Aggregate disjoint index propagation completed normally.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Aggregate disjoint index failed (status: %d).\n", st21);
+    }
+
+    /* 22. Aggregate: Stack pointer in aggregate remains non-heap */
+    total++;
+    printf("[TEST] Aggregate stack pointer remains non-heap...\n");
+    int st22 = run_in_child(mg_test_aggregate_stack_non_heap);
+    if (WIFEXITED(st22) && WEXITSTATUS(st22) == 0) {
+        printf("  [PASS] Aggregate with stack pointer executed without instrumentation.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Aggregate stack pointer failed (status: %d).\n", st22);
+    }
+
+    /* 23. Interprocedural aggregate argument: pure heap callers */
+    total++;
+    printf("[TEST] Interprocedural aggregate parameter with pure heap callers...\n");
+    int st23_val = run_in_child(mg_test_aggregate_interproc_valid);
+    int st23_oob = run_in_child(mg_test_aggregate_interproc_oob);
+    if (WIFEXITED(st23_val) && WEXITSTATUS(st23_val) == 0 &&
+        WIFSIGNALED(st23_oob) && WTERMSIG(st23_oob) == SIGABRT) {
+        printf("  [PASS] Interprocedural aggregate parameter valid passed and OOB aborted correctly.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Interprocedural aggregate parameter failed (val: %d, oob: %d).\n", st23_val, st23_oob);
+    }
+
+    /* 24. Interprocedural aggregate argument: mixed heap/stack callers */
+    total++;
+    printf("[TEST] Interprocedural aggregate parameter with mixed callers (uninstrumented)...\n");
+    int st24 = run_in_child(mg_test_aggregate_mixed);
+    if (WIFEXITED(st24) && WEXITSTATUS(st24) == 0) {
+        printf("  [PASS] Interprocedural mixed aggregate parameter remained uninstrumented and passed.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Interprocedural mixed aggregate parameter failed (status: %d).\n", st24);
+    }
+
+    /* 25. Pointer-preserving casts and conversions */
+    total++;
+    printf("[TEST] Pointer-preserving casts and conversions (valid & OOB)...\n");
+    int st25_val = run_in_child(mg_test_pointer_cast_valid);
+    int st25_oob = run_in_child(mg_test_pointer_cast_oob);
+    if (WIFEXITED(st25_val) && WEXITSTATUS(st25_val) == 0 &&
+        WIFSIGNALED(st25_oob) && WTERMSIG(st25_oob) == SIGABRT) {
+        printf("  [PASS] Pointer cast valid access passed and OOB aborted correctly.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Pointer cast failed (val: %d, oob: %d).\n", st25_val, st25_oob);
     }
 
     printf("====================================================\n");

@@ -52,17 +52,22 @@ target_link_libraries(test_allocation PRIVATE memoryguard)
 # Register the test case with CTest
 add_test(NAME test_allocation COMMAND test_allocation)
 
-# Find clang and opt to build and run the end-to-end compiler instrumentation test
+# Find clang, opt, and llvm-link to build and run the end-to-end compiler instrumentation test
 find_program(CLANG_TOOL NAMES clang-18 clang PATHS ${LLVM_TOOLS_BINARY_DIR})
 find_program(OPT_TOOL NAMES opt-18 opt PATHS ${LLVM_TOOLS_BINARY_DIR})
+find_program(LLVM_LINK_TOOL NAMES llvm-link-18 llvm-link PATHS ${LLVM_TOOLS_BINARY_DIR})
 
-if(CLANG_TOOL AND OPT_TOOL)
+if(CLANG_TOOL AND OPT_TOOL AND LLVM_LINK_TOOL)
     add_custom_command(
         OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/test_instrumentation_bin
         COMMAND ${CLANG_TOOL} -O0 -Xclang -disable-O0-optnone -emit-llvm -S
                 ${CMAKE_CURRENT_SOURCE_DIR}/examples/test_instrumentation.c
                 -I ${CMAKE_CURRENT_SOURCE_DIR}/runtime/include
-                -o ${CMAKE_CURRENT_BINARY_DIR}/test_instrumentation.ll
+                -o ${CMAKE_CURRENT_BINARY_DIR}/test_instrumentation_c.ll
+        COMMAND ${LLVM_LINK_TOOL}
+                ${CMAKE_CURRENT_BINARY_DIR}/test_instrumentation_c.ll
+                ${CMAKE_CURRENT_SOURCE_DIR}/examples/test_aggregates.ll
+                -S -o ${CMAKE_CURRENT_BINARY_DIR}/test_instrumentation.ll
         COMMAND ${OPT_TOOL} -load-pass-plugin=$<TARGET_FILE:MemoryGuardPass>
                 -passes=memoryguard
                 -S ${CMAKE_CURRENT_BINARY_DIR}/test_instrumentation.ll
@@ -71,7 +76,7 @@ if(CLANG_TOOL AND OPT_TOOL)
                 $<TARGET_FILE:memoryguard>
                 -pthread
                 -o ${CMAKE_CURRENT_BINARY_DIR}/test_instrumentation_bin
-        DEPENDS examples/test_instrumentation.c MemoryGuardPass memoryguard
+        DEPENDS examples/test_instrumentation.c examples/test_aggregates.ll MemoryGuardPass memoryguard
         COMMENT "Compiling, instrumenting, and linking end-to-end integration test"
     )
 

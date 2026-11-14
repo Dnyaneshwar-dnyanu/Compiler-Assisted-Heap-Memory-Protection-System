@@ -158,6 +158,19 @@ static PointerOrigin tracePointerOrigin(const Value *V,
                                         unsigned Depth,
                                         InterproceduralContext &ICtx);
 
+static PointerOrigin traceExtractedValueOrigin(const Value *Agg,
+                                               ArrayRef<unsigned> Indices,
+                                               const DominatorTree *DT,
+                                               SmallPtrSetImpl<const Value *> &Visited,
+                                               unsigned Depth,
+                                               InterproceduralContext &ICtx);
+
+static PointerOrigin traceArgumentAggregateOrigin(const Argument *Arg,
+                                                  ArrayRef<unsigned> Indices,
+                                                  SmallPtrSetImpl<const Value *> &Visited,
+                                                  unsigned Depth,
+                                                  InterproceduralContext &ICtx);
+
 /**
  * @brief Interprocedural pointer-origin analysis for function parameters.
  *
@@ -284,6 +297,244 @@ static PointerOrigin traceArgumentOrigin(const Argument *Arg,
 
     ICtx.ArgCache[Arg] = CommonOrigin;
     return CommonOrigin;
+}
+
+/**
+ * @brief Interprocedural aggregate origin analysis for function parameters.
+ *
+ * Follows aggregate values passed into function parameters at direct call sites
+ * to trace extracted pointer fields.
+ */
+static PointerOrigin traceArgumentAggregateOrigin(const Argument *Arg,
+                                                  ArrayRef<unsigned> Indices,
+                                                  SmallPtrSetImpl<const Value *> &Visited,
+                                                  unsigned Depth,
+                                                  InterproceduralContext &ICtx) {
+    if (!Arg || Indices.empty()) {
+        return PointerOrigin::UNKNOWN;
+    }
+
+    const Function *F = Arg->getParent();
+    if (!F || F->isDeclaration() || !F->hasLocalLinkage() || F->hasAddressTaken() || F->use_empty()) {
+        return PointerOrigin::UNKNOWN;
+    }
+
+    unsigned ArgNo = Arg->getArgNo();
+    PointerOrigin CommonOrigin = PointerOrigin::UNKNOWN;
+    bool FirstCallSite = true;
+
+    for (const Use &U : F->uses()) {
+        const User *UserObj = U.getUser();
+        auto *CB = dyn_cast<CallBase>(UserObj);
+        if (!CB || !CB->isCallee(&U) || ArgNo >= CB->arg_size()) {
+            return PointerOrigin::UNKNOWN;
+        }
+
+        Value *ActualArg = CB->getArgOperand(ArgNo);
+        if (!ActualArg) {
+            return PointerOrigin::UNKNOWN;
+        }
+
+        const Function *Caller = CB->getFunction();
+        if (!Caller || Caller->isDeclaration() || isMemoryGuardRuntimeFunction(*Caller)) {
+            return PointerOrigin::UNKNOWN;
+        }
+
+        const DominatorTree *CallerDT = nullptr;
+        if (ICtx.CurrentDT && ICtx.CurrentDT->getRoot() &&
+            ICtx.CurrentDT->getRoot()->getParent() == Caller) {
+            CallerDT = ICtx.CurrentDT;
+        } else {
+            auto DtIt = ICtx.DTCache.find(Caller);
+            if (DtIt != ICtx.DTCache.end()) {
+                CallerDT = DtIt->second.get();
+            } else {
+                auto NewDT = std::make_unique<DominatorTree>(const_cast<Function &>(*Caller));
+                CallerDT = NewDT.get();
+                ICtx.DTCache[Caller] = std::move(NewDT);
+            }
+        }
+
+        PointerOrigin ActualOrigin = traceExtractedValueOrigin(ActualArg, Indices, CallerDT, Visited, Depth + 1, ICtx);
+        if (ActualOrigin == PointerOrigin::UNKNOWN) {
+            return PointerOrigin::UNKNOWN;
+        }
+
+        if (FirstCallSite) {
+            CommonOrigin = ActualOrigin;
+            FirstCallSite = false;
+        } else if (CommonOrigin != ActualOrigin) {
+            return PointerOrigin::UNKNOWN;
+        }
+    }
+
+    return CommonOrigin;
+}
+
+/**
+ * @brief Traces the origin of a pointer extracted at @p Indices from an aggregate @p Agg.
+ *
+ * Handles InsertValueInst, Constants, Selects, PHIs, Freezes, Loads from alloca,
+ * and Arguments with nested struct and array indices.
+ */
+static PointerOrigin traceExtractedValueOrigin(const Value *Agg,
+                                               ArrayRef<unsigned> Indices,
+                                               const DominatorTree *DT,
+                                               SmallPtrSetImpl<const Value *> &Visited,
+                                               unsigned Depth,
+                                               InterproceduralContext &ICtx) {
+    if (!Agg || Indices.empty()) {
+        return PointerOrigin::UNKNOWN;
+    }
+
+    if (Depth > MaxTraversalDepth) {
+        return PointerOrigin::UNKNOWN;
+    }
+
+    PathVisitedScope Scope(Visited, Agg);
+    if (Scope.isCycle()) {
+        return PointerOrigin::UNKNOWN;
+    }
+
+    // 1. InsertValueInst
+    if (auto *IVI = dyn_cast<InsertValueInst>(Agg)) {
+        ArrayRef<unsigned> InsertIndices = IVI->getIndices();
+
+        // Exact index match: the extracted value is the value inserted here
+        if (Indices == InsertIndices) {
+            return tracePointerOrigin(IVI->getInsertedValueOperand(), DT, Visited, Depth + 1, ICtx);
+        }
+
+        // Nested aggregate insertion: InsertIndices is a prefix of Indices
+        // e.g. inserted a sub-struct at {0}, and extracting {0, 1}
+        if (InsertIndices.size() < Indices.size() &&
+            Indices.take_front(InsertIndices.size()) == InsertIndices) {
+            ArrayRef<unsigned> RemainingIndices = Indices.drop_front(InsertIndices.size());
+            return traceExtractedValueOrigin(IVI->getInsertedValueOperand(),
+                                             RemainingIndices,
+                                             DT, Visited, Depth + 1, ICtx);
+        }
+
+        // If Indices is a prefix of InsertIndices, a sub-element of the extracted pointer is modified
+        if (Indices.size() < InsertIndices.size() &&
+            InsertIndices.take_front(Indices.size()) == Indices) {
+            return PointerOrigin::UNKNOWN;
+        }
+
+        // Disjoint indices: the insertion does not affect the extracted field. Follow the base aggregate.
+        return traceExtractedValueOrigin(IVI->getAggregateOperand(),
+                                         Indices,
+                                         DT, Visited, Depth + 1, ICtx);
+    }
+
+    // 2. Constants
+    if (auto *C = dyn_cast<Constant>(Agg)) {
+        if (isa<UndefValue>(C)) {
+            return PointerOrigin::UNKNOWN;
+        }
+        if (isa<ConstantAggregateZero>(C)) {
+            return PointerOrigin::NON_HEAP;
+        }
+
+        const Constant *Curr = C;
+        for (unsigned Idx : Indices) {
+            if (!Curr) break;
+            Curr = Curr->getAggregateElement(Idx);
+        }
+
+        if (Curr && Curr->getType()->isPointerTy()) {
+            return tracePointerOrigin(Curr, DT, Visited, Depth + 1, ICtx);
+        }
+        return PointerOrigin::UNKNOWN;
+    }
+
+    // 3. Select instructions on aggregates
+    if (auto *SI = dyn_cast<SelectInst>(Agg)) {
+        PointerOrigin TrueOrigin = traceExtractedValueOrigin(SI->getTrueValue(), Indices, DT, Visited, Depth + 1, ICtx);
+        PointerOrigin FalseOrigin = traceExtractedValueOrigin(SI->getFalseValue(), Indices, DT, Visited, Depth + 1, ICtx);
+        if (TrueOrigin == FalseOrigin && TrueOrigin != PointerOrigin::UNKNOWN) {
+            return TrueOrigin;
+        }
+        return PointerOrigin::UNKNOWN;
+    }
+
+    // 4. PHI nodes on aggregates
+    if (auto *PN = dyn_cast<PHINode>(Agg)) {
+        if (PN->getNumIncomingValues() == 0) {
+            return PointerOrigin::UNKNOWN;
+        }
+        PointerOrigin CommonOrigin = PointerOrigin::UNKNOWN;
+        bool First = true;
+        for (const Value *Incoming : PN->incoming_values()) {
+            PointerOrigin IncOrigin = traceExtractedValueOrigin(Incoming, Indices, DT, Visited, Depth + 1, ICtx);
+            if (IncOrigin == PointerOrigin::UNKNOWN) {
+                return PointerOrigin::UNKNOWN;
+            }
+            if (First) {
+                CommonOrigin = IncOrigin;
+                First = false;
+            } else if (CommonOrigin != IncOrigin) {
+                return PointerOrigin::UNKNOWN;
+            }
+        }
+        return CommonOrigin;
+    }
+
+    // 5. Freeze instructions on aggregates
+    if (auto *FI = dyn_cast<FreezeInst>(Agg)) {
+        return traceExtractedValueOrigin(FI->getOperand(0), Indices, DT, Visited, Depth + 1, ICtx);
+    }
+
+    // 6. Load instruction from an alloca storing an aggregate
+    if (auto *LI = dyn_cast<LoadInst>(Agg)) {
+        if (auto *AI = dyn_cast<AllocaInst>(LI->getPointerOperand())) {
+            SmallVector<const StoreInst *, 4> Stores;
+            for (const User *U : AI->users()) {
+                if (auto *SI = dyn_cast<StoreInst>(U)) {
+                    if (SI->getValueOperand() == AI) {
+                        return PointerOrigin::UNKNOWN;
+                    }
+                    if (SI->getPointerOperand() == AI) {
+                        Stores.push_back(SI);
+                    }
+                } else if (isa<LoadInst>(U) || isa<IntrinsicInst>(U)) {
+                    continue;
+                } else {
+                    return PointerOrigin::UNKNOWN;
+                }
+            }
+
+            const StoreInst *LocalDominatingStore = nullptr;
+            for (const Instruction *I = LI->getPrevNode(); I != nullptr; I = I->getPrevNode()) {
+                if (auto *SI = dyn_cast<StoreInst>(I)) {
+                    if (SI->getPointerOperand() == AI) {
+                        LocalDominatingStore = SI;
+                        break;
+                    }
+                }
+            }
+            if (LocalDominatingStore) {
+                return traceExtractedValueOrigin(LocalDominatingStore->getValueOperand(),
+                                                 Indices, DT, Visited, Depth + 1, ICtx);
+            }
+
+            if (Stores.size() == 1 && DT) {
+                const StoreInst *SingleStore = Stores[0];
+                if (DT->dominates(SingleStore, LI)) {
+                    return traceExtractedValueOrigin(SingleStore->getValueOperand(),
+                                                     Indices, DT, Visited, Depth + 1, ICtx);
+                }
+            }
+        }
+        return PointerOrigin::UNKNOWN;
+    }
+
+    // 7. Function argument passing an aggregate
+    if (auto *Arg = dyn_cast<Argument>(Agg)) {
+        return traceArgumentAggregateOrigin(Arg, Indices, Visited, Depth, ICtx);
+    }
+
+    return PointerOrigin::UNKNOWN;
 }
 
 /**
@@ -436,12 +687,20 @@ static PointerOrigin tracePointerOrigin(const Value *V,
         return tracePointerOrigin(FI->getOperand(0), DT, Visited, Depth + 1, ICtx);
     }
 
-    // 10. Constant expressions (GEP or safe pointer casts)
+    // 10. Constant expressions (GEP, safe pointer casts, or select)
     if (auto *CE = dyn_cast<ConstantExpr>(V)) {
         if (CE->getOpcode() == Instruction::GetElementPtr ||
             CE->getOpcode() == Instruction::BitCast ||
             CE->getOpcode() == Instruction::AddrSpaceCast) {
             return tracePointerOrigin(CE->getOperand(0), DT, Visited, Depth + 1, ICtx);
+        }
+        if (CE->getOpcode() == Instruction::Select) {
+            PointerOrigin TrueOrigin = tracePointerOrigin(CE->getOperand(1), DT, Visited, Depth + 1, ICtx);
+            PointerOrigin FalseOrigin = tracePointerOrigin(CE->getOperand(2), DT, Visited, Depth + 1, ICtx);
+            if (TrueOrigin == FalseOrigin && TrueOrigin != PointerOrigin::UNKNOWN) {
+                return TrueOrigin;
+            }
+            return PointerOrigin::UNKNOWN;
         }
         return PointerOrigin::UNKNOWN;
     }
@@ -483,6 +742,16 @@ static PointerOrigin tracePointerOrigin(const Value *V,
         const Value *LoadSource = LI->getPointerOperand();
         if (auto *AI = dyn_cast<AllocaInst>(LoadSource)) {
             return traceAllocaOrigin(AI, LI, DT, Visited, Depth + 1, ICtx);
+        }
+        return PointerOrigin::UNKNOWN;
+    }
+
+    // 14. ExtractValue instructions: trace extracted pointer through aggregate operations
+    if (auto *EVI = dyn_cast<ExtractValueInst>(V)) {
+        if (EVI->getType()->isPointerTy()) {
+            return traceExtractedValueOrigin(EVI->getAggregateOperand(),
+                                             EVI->getIndices(),
+                                             DT, Visited, Depth + 1, ICtx);
         }
         return PointerOrigin::UNKNOWN;
     }
