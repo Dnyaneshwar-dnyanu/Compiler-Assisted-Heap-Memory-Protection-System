@@ -1,10 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
-project(MemoryGuard C)
+project(MemoryGuard LANGUAGES C CXX)
 
 # Specify C standard (C11)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+
+# Specify C++ standard (C++17 for LLVM plugins)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Enable compiler warnings
 if(MSVC)
@@ -23,6 +28,9 @@ target_include_directories(memoryguard PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/runtime/include>
     $<INSTALL_INTERFACE:include>
 )
+
+# Build the LLVM compiler plugin
+add_subdirectory(compiler)
 
 # Enable testing support for CTest
 enable_testing()
