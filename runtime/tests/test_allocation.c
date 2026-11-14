@@ -4,6 +4,12 @@
 #include <string.h>
 #include <stdint.h>
 
+#if defined(__unix__) || defined(__linux__) || defined(__APPLE__)
+#include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
+#endif
+
 #if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
 /**
  * @brief Provide default AddressSanitizer options.
@@ -467,6 +473,85 @@ static void test_external_allocations(void) {
     TEST_ASSERT(mg_get_tracked_count() == initial_count, "Final registry count matches initial count");
 }
 
+#if defined(__unix__) || defined(__linux__) || defined(__APPLE__)
+static int check_access_aborts(const void *ptr, size_t access_size) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        return 0;
+    }
+    if (pid == 0) {
+        /* In child process: silence stderr so expected failure messages don't clutter test output */
+        if (freopen("/dev/null", "w", stderr) == NULL) {
+            /* ignore if freopen fails */
+        }
+        mg_check_access(ptr, access_size);
+        exit(0); /* If mg_check_access did not abort, exit 0 */
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    /* Should terminate via SIGABRT */
+    return WIFSIGNALED(status) && (WTERMSIG(status) == SIGABRT);
+}
+#endif
+
+/**
+ * @brief Tests mg_check_access validation and abort behavior.
+ */
+static void test_check_access(void) {
+    size_t alloc_size = 64;
+    void *buf = mg_malloc(alloc_size);
+    TEST_ASSERT(buf != NULL, "Allocated buffer for mg_check_access test");
+
+    /* 1. Valid accesses must succeed without aborting */
+    mg_check_access(buf, 1);
+    mg_check_access(buf, alloc_size);
+    mg_check_access((char *)buf + 10, 20);
+    mg_check_access((char *)buf + alloc_size - 1, 1);
+    TEST_ASSERT(1, "Valid accesses succeeded through mg_check_access without aborting");
+
+    /* 2. External allocation valid accesses */
+    void *ext_buf = malloc(128);
+    TEST_ASSERT(ext_buf != NULL, "Allocated external buffer");
+    TEST_ASSERT(mg_register_external(ext_buf, 128) == 1, "Registered external buffer");
+    mg_check_access(ext_buf, 128);
+    mg_check_access((char *)ext_buf + 50, 50);
+    TEST_ASSERT(1, "Valid accesses to external buffer succeeded through mg_check_access");
+    TEST_ASSERT(mg_unregister_external(ext_buf) == 1, "Unregistered external buffer");
+    free(ext_buf);
+
+#if defined(__unix__) || defined(__linux__) || defined(__APPLE__)
+    /* 3. Out-of-bounds access must abort */
+    TEST_ASSERT(check_access_aborts(buf, alloc_size + 1),
+                "mg_check_access aborts on access exceeding allocation size");
+    TEST_ASSERT(check_access_aborts((char *)buf + 50, 20),
+                "mg_check_access aborts on interior access extending past end");
+    TEST_ASSERT(check_access_aborts((char *)buf + alloc_size, 1),
+                "mg_check_access aborts on access starting at boundary");
+
+    /* 4. NULL pointer access must abort */
+    TEST_ASSERT(check_access_aborts(NULL, 1),
+                "mg_check_access aborts on NULL pointer");
+
+    /* 5. Untracked stack variable must abort */
+    int stack_var = 42;
+    TEST_ASSERT(check_access_aborts(&stack_var, sizeof(stack_var)),
+                "mg_check_access aborts on untracked stack variable");
+
+    /* 6. Arithmetic overflow must abort */
+    TEST_ASSERT(check_access_aborts(buf, SIZE_MAX),
+                "mg_check_access aborts on SIZE_MAX access overflow");
+#endif
+
+    /* 7. Clean up and test access after free */
+    mg_free(buf);
+
+#if defined(__unix__) || defined(__linux__) || defined(__APPLE__)
+    /* Buffer is now freed and no longer tracked; access must abort */
+    TEST_ASSERT(check_access_aborts(buf, 1),
+                "mg_check_access aborts on access to deallocated buffer");
+#endif
+}
+
 int main(void) {
     printf("========================================\n");
     printf("  MemoryGuard Allocation Registry Tests \n");
@@ -480,6 +565,7 @@ int main(void) {
     RUN_TEST(test_null_allocation_handling);
     RUN_TEST(test_boundary_validation);
     RUN_TEST(test_external_allocations);
+    RUN_TEST(test_check_access);
 
     printf("========================================\n");
     printf("Summary: %d assertions, %d failed\n", total_assertions, failed_assertions);

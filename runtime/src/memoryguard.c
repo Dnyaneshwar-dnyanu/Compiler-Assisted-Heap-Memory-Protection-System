@@ -1,4 +1,5 @@
 #include "memoryguard.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 
@@ -175,6 +176,16 @@ int mg_is_valid_access(const void *ptr, size_t access_size) {
 
     /* Pointer/range is outside all tracked allocations */
     return 0;
+}
+
+void mg_check_access(const void *ptr, size_t access_size) {
+    if (!mg_is_valid_access(ptr, access_size)) {
+        fprintf(stderr,
+                "MemoryGuard: VIOLATION DETECTED! Invalid access to ptr=%p, access_size=%zu bytes\n",
+                ptr, access_size);
+        fflush(stderr);
+        abort();
+    }
 }
 
 int mg_register_external(void *ptr, size_t size) {

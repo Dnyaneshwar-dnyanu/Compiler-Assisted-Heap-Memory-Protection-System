@@ -5,6 +5,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -327,11 +328,54 @@ static PointerOrigin classifyPointerOrigin(const Value *V, const DominatorTree *
 }
 
 /**
+ * @brief Retrieves or declares the mg_check_access function declaration in the target module.
+ *
+ * void mg_check_access(const void *ptr, size_t access_size);
+ */
+static FunctionCallee getOrInsertCheckFunction(Module &M, const DataLayout &DL) {
+    LLVMContext &Ctx = M.getContext();
+    Type *VoidTy = Type::getVoidTy(Ctx);
+    Type *PtrTy = PointerType::getUnqual(Ctx);
+    Type *SizeTy = DL.getIntPtrType(Ctx);
+    FunctionType *FTy = FunctionType::get(VoidTy, {PtrTy, SizeTy}, false);
+    return M.getOrInsertFunction("mg_check_access", FTy);
+}
+
+/**
+ * @brief Checks if a memory access instruction has already been instrumented.
+ *
+ * Prevents duplicate instrumentation by checking for pass metadata or an immediately
+ * preceding call to mg_check_access with matching arguments.
+ */
+static bool isAlreadyInstrumented(const Instruction *I, const Value *Ptr, uint64_t Size) {
+    if (I->getMetadata("memoryguard.checked")) {
+        return true;
+    }
+    if (const Instruction *Prev = I->getPrevNode()) {
+        if (auto *CB = dyn_cast<CallBase>(Prev)) {
+            if (const Function *Callee = CB->getCalledFunction()) {
+                if (Callee->getName() == "mg_check_access" && CB->arg_size() == 2) {
+                    if (CB->getArgOperand(0) == Ptr) {
+                        if (auto *CI = dyn_cast<ConstantInt>(CB->getArgOperand(1))) {
+                            if (CI->getZExtValue() == Size) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/**
  * @brief MemoryGuard Function Pass for analyzing LLVM memory operations and heap allocations.
  *
  * Inspects each function for:
  *  1. Heap allocation API calls (malloc, calloc, realloc).
  *  2. Memory access instructions (LoadInst and StoreInst) with pointer-origin classification.
+ *  3. Instruments HEAP_CANDIDATE memory accesses with runtime boundary validation checks.
  */
 class MemoryGuardPass : public PassInfoMixin<MemoryGuardPass> {
 public:
@@ -344,6 +388,13 @@ public:
 
         const DataLayout &DL = F.getParent()->getDataLayout();
         DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+
+        struct InstrumentationSite {
+            Instruction *Inst;
+            Value *Ptr;
+            uint64_t AccessSize;
+        };
+        SmallVector<InstrumentationSite, 16> SitesToInstrument;
 
         for (BasicBlock &BB : F) {
             for (Instruction &I : BB) {
@@ -367,6 +418,18 @@ public:
                         errs() << StoreSize.getFixedValue() << " bytes";
                     }
                     errs() << " origin=" << originToString(Origin) << "\n";
+
+                    // Instrument only HEAP_CANDIDATE load accesses with fixed sizes and standard address space
+                    if (Origin == PointerOrigin::HEAP_CANDIDATE && !StoreSize.isScalable()) {
+                        if (auto *PT = dyn_cast<PointerType>(Ptr->getType())) {
+                            if (PT->getAddressSpace() == 0) {
+                                uint64_t FixedSize = StoreSize.getFixedValue();
+                                if (!isAlreadyInstrumented(LI, Ptr, FixedSize)) {
+                                    SitesToInstrument.push_back({LI, Ptr, FixedSize});
+                                }
+                            }
+                        }
+                    }
                 } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
                     Value *Ptr = SI->getPointerOperand();
                     Type *StoredType = SI->getValueOperand()->getType();
@@ -385,11 +448,41 @@ public:
                         errs() << StoreSize.getFixedValue() << " bytes";
                     }
                     errs() << " origin=" << originToString(Origin) << "\n";
+
+                    // Instrument only HEAP_CANDIDATE store accesses with fixed sizes and standard address space
+                    if (Origin == PointerOrigin::HEAP_CANDIDATE && !StoreSize.isScalable()) {
+                        if (auto *PT = dyn_cast<PointerType>(Ptr->getType())) {
+                            if (PT->getAddressSpace() == 0) {
+                                uint64_t FixedSize = StoreSize.getFixedValue();
+                                if (!isAlreadyInstrumented(SI, Ptr, FixedSize)) {
+                                    SitesToInstrument.push_back({SI, Ptr, FixedSize});
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        return PreservedAnalyses::all();
+        if (SitesToInstrument.empty()) {
+            return PreservedAnalyses::all();
+        }
+
+        FunctionCallee CheckFn = getOrInsertCheckFunction(*F.getParent(), DL);
+        LLVMContext &Ctx = F.getContext();
+        Type *SizeTy = DL.getIntPtrType(Ctx);
+
+        for (const auto &Site : SitesToInstrument) {
+            IRBuilder<> Builder(Site.Inst);
+            Value *SizeVal = ConstantInt::get(SizeTy, Site.AccessSize);
+            CallInst *CheckCall = Builder.CreateCall(CheckFn, {Site.Ptr, SizeVal});
+            CheckCall->setCallingConv(CallingConv::C);
+            Site.Inst->setMetadata("memoryguard.checked", MDNode::get(Ctx, {}));
+        }
+
+        PreservedAnalyses PA;
+        PA.preserve<DominatorTreeAnalysis>();
+        return PA;
     }
 
     // Ensure the pass runs on all functions, including unoptimized (-O0) code

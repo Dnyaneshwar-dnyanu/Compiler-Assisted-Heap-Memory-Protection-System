@@ -88,6 +88,23 @@ size_t mg_get_tracked_count(void);
 int mg_is_valid_access(const void *ptr, size_t access_size);
 
 /**
+ * @brief Validates that a heap memory access range is valid, aborting on failure.
+ *
+ * Checks whether the memory range [ptr, ptr + access_size) lies entirely within
+ * an active allocation tracked by MemoryGuard by calling mg_is_valid_access().
+ *
+ * If the access is valid, this function returns normally.
+ * If the access is invalid (e.g. out-of-bounds access, access after deallocation,
+ * NULL pointer, untracked address, or arithmetic overflow), this function prints
+ * diagnostic details to stderr with the offending pointer and access size, then terminates
+ * execution by calling abort().
+ *
+ * @param ptr Starting address of the memory access.
+ * @param access_size Size of the memory access in bytes.
+ */
+void mg_check_access(const void *ptr, size_t access_size);
+
+/**
  * @brief Registers an external heap allocation with the MemoryGuard registry.
  *
  * Tracks an existing buffer allocated through standard C allocation functions
