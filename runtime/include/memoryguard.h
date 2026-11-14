@@ -8,6 +8,15 @@ extern "C" {
 #endif
 
 /**
+ * @file memoryguard.h
+ * @brief MemoryGuard C Runtime Interface.
+ *
+ * Provides thread-safe heap allocation tracking, boundary validation, and
+ * allocator interception APIs. All operations on the allocation registry are
+ * synchronized and safe for concurrent multi-threaded execution.
+ */
+
+/**
  * @brief Allocates heap memory and records it in the allocation registry.
  *
  * Allocates `size` bytes of memory using standard malloc, creates an Allocation

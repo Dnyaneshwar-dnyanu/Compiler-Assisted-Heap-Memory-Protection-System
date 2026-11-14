@@ -18,6 +18,9 @@ else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+# Find system thread support for runtime thread-safety
+find_package(Threads REQUIRED)
+
 # Build MemoryGuard runtime as a static library
 add_library(memoryguard STATIC
     runtime/src/memoryguard.c
@@ -28,6 +31,9 @@ target_include_directories(memoryguard PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/runtime/include>
     $<INSTALL_INTERFACE:include>
 )
+
+# Link threads to the runtime library
+target_link_libraries(memoryguard PUBLIC Threads::Threads)
 
 # Build the LLVM compiler plugin
 add_subdirectory(compiler)
@@ -63,6 +69,7 @@ if(CLANG_TOOL AND OPT_TOOL)
                 -o ${CMAKE_CURRENT_BINARY_DIR}/test_instrumentation_inst.ll
         COMMAND ${CLANG_TOOL} ${CMAKE_CURRENT_BINARY_DIR}/test_instrumentation_inst.ll
                 $<TARGET_FILE:memoryguard>
+                -pthread
                 -o ${CMAKE_CURRENT_BINARY_DIR}/test_instrumentation_bin
         DEPENDS examples/test_instrumentation.c MemoryGuardPass memoryguard
         COMMENT "Compiling, instrumenting, and linking end-to-end integration test"

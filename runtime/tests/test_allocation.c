@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <pthread.h>
 
 #if defined(__unix__) || defined(__linux__) || defined(__APPLE__)
 #include <unistd.h>
@@ -18,6 +19,15 @@
  * extreme sizes (such as SIZE_MAX in failure tests) rather than aborting.
  */
 const char *__asan_default_options(void) {
+    return "allocator_may_return_null=1";
+}
+#endif
+
+#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+/**
+ * @brief Provide default ThreadSanitizer options.
+ */
+const char *__tsan_default_options(void) {
     return "allocator_may_return_null=1";
 }
 #endif
@@ -781,6 +791,397 @@ static void test_interceptor_apis(void) {
     TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry count perfectly restored after all interceptor tests");
 }
 
+/* =========================================================================
+ * Multithreaded Registry Tests
+ * ========================================================================= */
+
+typedef struct {
+    int thread_id;
+    int assertions;
+    int failures;
+} ThreadTestArg;
+
+#define THREAD_ASSERT(arg, cond, msg) do { \
+    (arg)->assertions++; \
+    if (!(cond)) { \
+        fprintf(stderr, "  [FAIL Thread %d] Line %d: %s (%s)\n", (arg)->thread_id, __LINE__, msg, #cond); \
+        (arg)->failures++; \
+    } \
+} while (0)
+
+/* --- Test 11: Concurrent mg_malloc and mg_free across multiple threads --- */
+#define NUM_MALLOC_THREADS 8
+#define ALLOCS_PER_THREAD 50
+
+static void *thread_worker_malloc_free(void *arg_ptr) {
+    ThreadTestArg *arg = (ThreadTestArg *)arg_ptr;
+    void *ptrs[ALLOCS_PER_THREAD];
+    size_t sizes[ALLOCS_PER_THREAD];
+
+    for (int i = 0; i < ALLOCS_PER_THREAD; i++) {
+        sizes[i] = 16 + ((size_t)i * 17) % 256;
+        ptrs[i] = mg_malloc(sizes[i]);
+        THREAD_ASSERT(arg, ptrs[i] != NULL, "Thread mg_malloc returned non-NULL");
+        if (ptrs[i] != NULL) {
+            THREAD_ASSERT(arg, mg_is_tracked(ptrs[i]) == 1, "Allocated ptr is tracked");
+            THREAD_ASSERT(arg, mg_get_allocation_size(ptrs[i]) == sizes[i], "Recorded size matches");
+            THREAD_ASSERT(arg, mg_is_valid_access(ptrs[i], sizes[i]) == 1, "Full access is valid");
+            THREAD_ASSERT(arg, mg_is_valid_access(ptrs[i], sizes[i] + 1) == 0, "OOB access is invalid");
+
+            /* Write and verify test pattern */
+            memset(ptrs[i], 0x5A + arg->thread_id, sizes[i]);
+            unsigned char *byte_ptr = (unsigned char *)ptrs[i];
+            THREAD_ASSERT(arg, byte_ptr[0] == (unsigned char)(0x5A + arg->thread_id), "First byte pattern matches");
+            THREAD_ASSERT(arg, byte_ptr[sizes[i] - 1] == (unsigned char)(0x5A + arg->thread_id), "Last byte pattern matches");
+        }
+    }
+
+    /* Free all allocations in reverse order */
+    for (int i = ALLOCS_PER_THREAD - 1; i >= 0; i--) {
+        if (ptrs[i] != NULL) {
+            mg_free(ptrs[i]);
+            THREAD_ASSERT(arg, mg_is_tracked(ptrs[i]) == 0, "Freed pointer is no longer tracked");
+            THREAD_ASSERT(arg, mg_is_valid_access(ptrs[i], 1) == 0, "Freed pointer access is invalid");
+        }
+    }
+
+    return NULL;
+}
+
+static void test_multithreaded_malloc_free(void) {
+    size_t initial_count = mg_get_tracked_count();
+    pthread_t threads[NUM_MALLOC_THREADS];
+    ThreadTestArg thread_args[NUM_MALLOC_THREADS];
+
+    for (int i = 0; i < NUM_MALLOC_THREADS; i++) {
+        thread_args[i].thread_id = i;
+        thread_args[i].assertions = 0;
+        thread_args[i].failures = 0;
+        int rc = pthread_create(&threads[i], NULL, thread_worker_malloc_free, &thread_args[i]);
+        TEST_ASSERT(rc == 0, "pthread_create succeeded for malloc/free worker");
+    }
+
+    for (int i = 0; i < NUM_MALLOC_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+        total_assertions += thread_args[i].assertions;
+        failed_assertions += thread_args[i].failures;
+    }
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count,
+                "Tracked count perfectly restored after multithreaded malloc/free");
+}
+
+/* --- Test 12: Concurrent external registration, reallocation, and duplicate races --- */
+#define NUM_EXT_THREADS 8
+#define EXT_ALLOCS_PER_THREAD 20
+
+static void *thread_worker_external_realloc(void *arg_ptr) {
+    ThreadTestArg *arg = (ThreadTestArg *)arg_ptr;
+    void *ptrs[EXT_ALLOCS_PER_THREAD];
+
+    for (int i = 0; i < EXT_ALLOCS_PER_THREAD; i++) {
+        size_t orig_size = 32 + (size_t)i * 8;
+        ptrs[i] = malloc(orig_size);
+        THREAD_ASSERT(arg, ptrs[i] != NULL, "Standard malloc succeeded in worker");
+
+        int reg_ok = mg_register_external(ptrs[i], orig_size);
+        THREAD_ASSERT(arg, reg_ok == 1, "External registration succeeded");
+        THREAD_ASSERT(arg, mg_is_tracked(ptrs[i]) == 1, "External pointer is tracked");
+        THREAD_ASSERT(arg, mg_get_allocation_size(ptrs[i]) == orig_size, "Initial size recorded");
+
+        /* Reallocate to 3x size */
+        size_t new_size = orig_size * 3;
+        void *realloc_ptr = mg_realloc_external(ptrs[i], new_size);
+        THREAD_ASSERT(arg, realloc_ptr != NULL, "Reallocation succeeded");
+        if (realloc_ptr != NULL) {
+            ptrs[i] = realloc_ptr;
+            THREAD_ASSERT(arg, mg_is_tracked(ptrs[i]) == 1, "Reallocated pointer tracked");
+            THREAD_ASSERT(arg, mg_get_allocation_size(ptrs[i]) == new_size, "Reallocated size updated");
+            THREAD_ASSERT(arg, mg_is_valid_access(ptrs[i], new_size) == 1, "Reallocated range is valid");
+        }
+
+        /* Unregister and free */
+        int unreg_ok = mg_unregister_external(ptrs[i]);
+        THREAD_ASSERT(arg, unreg_ok == 1, "Unregistration succeeded");
+        THREAD_ASSERT(arg, mg_is_tracked(ptrs[i]) == 0, "Unregistered pointer no longer tracked");
+        free(ptrs[i]);
+    }
+
+    return NULL;
+}
+
+typedef struct {
+    int thread_id;
+    void *shared_buffer;
+    size_t buffer_size;
+    int reg_result;
+} DuplicateRaceArg;
+
+static void *thread_worker_duplicate_race(void *arg_ptr) {
+    DuplicateRaceArg *arg = (DuplicateRaceArg *)arg_ptr;
+    arg->reg_result = mg_register_external(arg->shared_buffer, arg->buffer_size);
+    return NULL;
+}
+
+static void test_multithreaded_external_and_realloc(void) {
+    size_t initial_count = mg_get_tracked_count();
+
+    /* 1. Concurrent registration and reallocation across independent pointers */
+    pthread_t threads[NUM_EXT_THREADS];
+    ThreadTestArg thread_args[NUM_EXT_THREADS];
+
+    for (int i = 0; i < NUM_EXT_THREADS; i++) {
+        thread_args[i].thread_id = i;
+        thread_args[i].assertions = 0;
+        thread_args[i].failures = 0;
+        int rc = pthread_create(&threads[i], NULL, thread_worker_external_realloc, &thread_args[i]);
+        TEST_ASSERT(rc == 0, "pthread_create succeeded for external worker");
+    }
+
+    for (int i = 0; i < NUM_EXT_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+        total_assertions += thread_args[i].assertions;
+        failed_assertions += thread_args[i].failures;
+    }
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count,
+                "Registry count restored after concurrent external registration/realloc");
+
+    /* 2. Concurrent race on duplicate registration of the exact same pointer */
+    void *shared_buf = malloc(128);
+    TEST_ASSERT(shared_buf != NULL, "Allocated shared buffer for duplicate registration test");
+
+    DuplicateRaceArg race_args[NUM_EXT_THREADS];
+    for (int i = 0; i < NUM_EXT_THREADS; i++) {
+        race_args[i].thread_id = i;
+        race_args[i].shared_buffer = shared_buf;
+        race_args[i].buffer_size = 128;
+        race_args[i].reg_result = -1;
+        pthread_create(&threads[i], NULL, thread_worker_duplicate_race, &race_args[i]);
+    }
+
+    int success_count = 0;
+    int fail_count = 0;
+    for (int i = 0; i < NUM_EXT_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+        if (race_args[i].reg_result == 1) {
+            success_count++;
+        } else if (race_args[i].reg_result == 0) {
+            fail_count++;
+        }
+    }
+
+    TEST_ASSERT(success_count == 1, "Exactly one thread succeeded in registering the shared pointer");
+    TEST_ASSERT(fail_count == NUM_EXT_THREADS - 1, "All other threads failed with 0 on duplicate registration");
+    TEST_ASSERT(mg_is_tracked(shared_buf) == 1, "Shared buffer is registered");
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Tracked count increased by exactly 1");
+
+    int unreg = mg_unregister_external(shared_buf);
+    TEST_ASSERT(unreg == 1, "Successfully unregistered shared buffer");
+    free(shared_buf);
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count,
+                "Registry count restored after duplicate registration race test");
+}
+
+/* --- Test 13: Concurrent Readers (mg_is_valid_access) and Writers (malloc/free/realloc) --- */
+#define NUM_RW_READERS 4
+#define NUM_RW_WRITERS 4
+#define NUM_SHARED_BUFFERS 10
+#define RW_ITERATIONS 100
+
+static void *shared_rw_ptrs[NUM_SHARED_BUFFERS];
+static size_t shared_rw_sizes[NUM_SHARED_BUFFERS];
+
+static void *thread_worker_reader(void *arg_ptr) {
+    ThreadTestArg *arg = (ThreadTestArg *)arg_ptr;
+
+    for (int iter = 0; iter < RW_ITERATIONS; iter++) {
+        for (int k = 0; k < NUM_SHARED_BUFFERS; k++) {
+            void *p = shared_rw_ptrs[k];
+            size_t sz = shared_rw_sizes[k];
+
+            int tracked = mg_is_tracked(p);
+            THREAD_ASSERT(arg, tracked == 1, "Shared buffer is tracked");
+
+            size_t rec_sz = mg_get_allocation_size(p);
+            THREAD_ASSERT(arg, rec_sz == sz, "Shared buffer size matches");
+
+            int valid_base = mg_is_valid_access(p, sz);
+            THREAD_ASSERT(arg, valid_base == 1, "Valid full access returns 1");
+
+            int valid_half = mg_is_valid_access(p, sz / 2);
+            THREAD_ASSERT(arg, valid_half == 1, "Valid interior access returns 1");
+
+            int invalid_oob = mg_is_valid_access(p, sz + 1);
+            THREAD_ASSERT(arg, invalid_oob == 0, "OOB access returns 0");
+
+            int invalid_cross = mg_is_valid_access((char *)p + 1, sz);
+            THREAD_ASSERT(arg, invalid_cross == 0, "Cross-boundary access returns 0");
+        }
+    }
+
+    return NULL;
+}
+
+static void *thread_worker_writer(void *arg_ptr) {
+    ThreadTestArg *arg = (ThreadTestArg *)arg_ptr;
+
+    for (int iter = 0; iter < RW_ITERATIONS / 2; iter++) {
+        /* Malloc and free private memory */
+        size_t sz = 32 + ((size_t)iter * 8) % 128;
+        void *p = mg_malloc(sz);
+        THREAD_ASSERT(arg, p != NULL, "Writer mg_malloc succeeded");
+        if (p) {
+            THREAD_ASSERT(arg, mg_is_valid_access(p, sz) == 1, "Writer access valid");
+            mg_free(p);
+            THREAD_ASSERT(arg, mg_is_valid_access(p, sz) == 0, "Writer access after free invalid");
+        }
+
+        /* External registration and realloc private memory */
+        void *ext = malloc(sz);
+        THREAD_ASSERT(arg, ext != NULL, "Writer malloc succeeded");
+        if (ext) {
+            THREAD_ASSERT(arg, mg_register_external(ext, sz) == 1, "Writer register succeeded");
+            void *realloced = mg_realloc_external(ext, sz * 2);
+            THREAD_ASSERT(arg, realloced != NULL, "Writer realloc succeeded");
+            if (realloced) {
+                ext = realloced;
+            }
+            THREAD_ASSERT(arg, mg_unregister_external(ext) == 1, "Writer unregister succeeded");
+            free(ext);
+        }
+    }
+
+    return NULL;
+}
+
+static void test_multithreaded_concurrent_readers_writers(void) {
+    size_t initial_count = mg_get_tracked_count();
+
+    /* Pre-register shared buffers for readers */
+    for (int i = 0; i < NUM_SHARED_BUFFERS; i++) {
+        shared_rw_sizes[i] = (size_t)(i + 1) * 64;
+        shared_rw_ptrs[i] = mg_malloc(shared_rw_sizes[i]);
+        TEST_ASSERT(shared_rw_ptrs[i] != NULL, "Pre-allocated shared reader buffer");
+        memset(shared_rw_ptrs[i], 0x3C, shared_rw_sizes[i]);
+    }
+
+    pthread_t reader_threads[NUM_RW_READERS];
+    pthread_t writer_threads[NUM_RW_WRITERS];
+    ThreadTestArg reader_args[NUM_RW_READERS];
+    ThreadTestArg writer_args[NUM_RW_WRITERS];
+
+    /* Launch readers and writers concurrently */
+    for (int i = 0; i < NUM_RW_READERS; i++) {
+        reader_args[i].thread_id = i;
+        reader_args[i].assertions = 0;
+        reader_args[i].failures = 0;
+        pthread_create(&reader_threads[i], NULL, thread_worker_reader, &reader_args[i]);
+    }
+    for (int i = 0; i < NUM_RW_WRITERS; i++) {
+        writer_args[i].thread_id = 100 + i;
+        writer_args[i].assertions = 0;
+        writer_args[i].failures = 0;
+        pthread_create(&writer_threads[i], NULL, thread_worker_writer, &writer_args[i]);
+    }
+
+    for (int i = 0; i < NUM_RW_READERS; i++) {
+        pthread_join(reader_threads[i], NULL);
+        total_assertions += reader_args[i].assertions;
+        failed_assertions += reader_args[i].failures;
+    }
+    for (int i = 0; i < NUM_RW_WRITERS; i++) {
+        pthread_join(writer_threads[i], NULL);
+        total_assertions += writer_args[i].assertions;
+        failed_assertions += writer_args[i].failures;
+    }
+
+    /* Clean up shared reader buffers */
+    for (int i = 0; i < NUM_SHARED_BUFFERS; i++) {
+        mg_free(shared_rw_ptrs[i]);
+    }
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count,
+                "Tracked count perfectly restored after reader-writer concurrency test");
+}
+
+/* --- Test 14: Concurrent allocator interceptor APIs --- */
+#define NUM_INTERCEPTOR_THREADS 8
+#define INTERCEPTOR_ITERS 25
+
+static void *thread_worker_interceptors(void *arg_ptr) {
+    ThreadTestArg *arg = (ThreadTestArg *)arg_ptr;
+
+    for (int iter = 0; iter < INTERCEPTOR_ITERS; iter++) {
+        /* 1. mg_intercept_malloc */
+        size_t m_sz = 48 + ((size_t)iter * 7) % 64;
+        int *m_ptr = (int *)mg_intercept_malloc(m_sz);
+        THREAD_ASSERT(arg, m_ptr != NULL, "mg_intercept_malloc returned non-NULL");
+        if (m_ptr) {
+            THREAD_ASSERT(arg, mg_is_tracked(m_ptr) == 1, "Intercepted malloc is tracked");
+            THREAD_ASSERT(arg, mg_is_valid_access(m_ptr, m_sz) == 1, "Access is valid");
+            m_ptr[0] = 777;
+            mg_intercept_free(m_ptr);
+            THREAD_ASSERT(arg, mg_is_tracked(m_ptr) == 0, "Intercepted malloc freed");
+        }
+
+        /* 2. mg_intercept_calloc */
+        size_t nmemb = 16;
+        int *c_ptr = (int *)mg_intercept_calloc(nmemb, sizeof(int));
+        THREAD_ASSERT(arg, c_ptr != NULL, "mg_intercept_calloc returned non-NULL");
+        if (c_ptr) {
+            THREAD_ASSERT(arg, mg_is_tracked(c_ptr) == 1, "Intercepted calloc is tracked");
+            THREAD_ASSERT(arg, c_ptr[0] == 0 && c_ptr[nmemb - 1] == 0, "Calloc zero-initialized");
+            c_ptr[0] = 888;
+            mg_intercept_free(c_ptr);
+            THREAD_ASSERT(arg, mg_is_tracked(c_ptr) == 0, "Intercepted calloc freed");
+        }
+
+        /* 3. mg_intercept_realloc */
+        void *r_ptr = mg_intercept_malloc(32);
+        THREAD_ASSERT(arg, r_ptr != NULL, "Initial alloc for realloc non-NULL");
+        if (r_ptr) {
+            memset(r_ptr, 0xAA, 32);
+            void *r_exp = mg_intercept_realloc(r_ptr, 128);
+            THREAD_ASSERT(arg, r_exp != NULL, "mg_intercept_realloc expanded buffer");
+            if (r_exp) {
+                unsigned char *b = (unsigned char *)r_exp;
+                THREAD_ASSERT(arg, b[0] == 0xAA && b[31] == 0xAA, "Original bytes preserved in realloc");
+                THREAD_ASSERT(arg, mg_is_tracked(r_exp) == 1, "Reallocated buffer tracked");
+                THREAD_ASSERT(arg, mg_get_allocation_size(r_exp) == 128, "Reallocated size is 128");
+                mg_intercept_free(r_exp);
+            } else {
+                mg_intercept_free(r_ptr);
+            }
+        }
+    }
+
+    return NULL;
+}
+
+static void test_multithreaded_interceptors(void) {
+    size_t initial_count = mg_get_tracked_count();
+    pthread_t threads[NUM_INTERCEPTOR_THREADS];
+    ThreadTestArg thread_args[NUM_INTERCEPTOR_THREADS];
+
+    for (int i = 0; i < NUM_INTERCEPTOR_THREADS; i++) {
+        thread_args[i].thread_id = i;
+        thread_args[i].assertions = 0;
+        thread_args[i].failures = 0;
+        pthread_create(&threads[i], NULL, thread_worker_interceptors, &thread_args[i]);
+    }
+
+    for (int i = 0; i < NUM_INTERCEPTOR_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+        total_assertions += thread_args[i].assertions;
+        failed_assertions += thread_args[i].failures;
+    }
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count,
+                "Registry count perfectly restored after multithreaded interceptor test");
+}
+
 int main(void) {
     printf("========================================\n");
     printf("  MemoryGuard Allocation Registry Tests \n");
@@ -796,6 +1197,10 @@ int main(void) {
     RUN_TEST(test_external_allocations);
     RUN_TEST(test_check_access);
     RUN_TEST(test_interceptor_apis);
+    RUN_TEST(test_multithreaded_malloc_free);
+    RUN_TEST(test_multithreaded_external_and_realloc);
+    RUN_TEST(test_multithreaded_concurrent_readers_writers);
+    RUN_TEST(test_multithreaded_interceptors);
 
     printf("========================================\n");
     printf("Summary: %d assertions, %d failed\n", total_assertions, failed_assertions);
