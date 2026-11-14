@@ -66,13 +66,14 @@ static bool isHeapAllocCall(const Value *V) {
     }
 
     StringRef Name = Callee->getName();
-    if (Name == "malloc" && CB->arg_size() == 1) {
+    if ((Name == "malloc" || Name == "mg_malloc" || Name == "mg_intercept_malloc") &&
+        CB->arg_size() == 1) {
         return true;
     }
-    if (Name == "calloc" && CB->arg_size() == 2) {
+    if ((Name == "calloc" || Name == "mg_intercept_calloc") && CB->arg_size() == 2) {
         return true;
     }
-    if (Name == "realloc" && CB->arg_size() == 2) {
+    if ((Name == "realloc" || Name == "mg_intercept_realloc") && CB->arg_size() == 2) {
         return true;
     }
     return false;
@@ -341,6 +342,126 @@ static FunctionCallee getOrInsertCheckFunction(Module &M, const DataLayout &DL) 
     return M.getOrInsertFunction("mg_check_access", FTy);
 }
 
+static FunctionCallee getOrInsertInterceptMalloc(Module &M, const DataLayout &DL) {
+    LLVMContext &Ctx = M.getContext();
+    Type *PtrTy = PointerType::getUnqual(Ctx);
+    Type *SizeTy = DL.getIntPtrType(Ctx);
+    FunctionType *FTy = FunctionType::get(PtrTy, {SizeTy}, false);
+    return M.getOrInsertFunction("mg_intercept_malloc", FTy);
+}
+
+static FunctionCallee getOrInsertInterceptCalloc(Module &M, const DataLayout &DL) {
+    LLVMContext &Ctx = M.getContext();
+    Type *PtrTy = PointerType::getUnqual(Ctx);
+    Type *SizeTy = DL.getIntPtrType(Ctx);
+    FunctionType *FTy = FunctionType::get(PtrTy, {SizeTy, SizeTy}, false);
+    return M.getOrInsertFunction("mg_intercept_calloc", FTy);
+}
+
+static FunctionCallee getOrInsertInterceptRealloc(Module &M, const DataLayout &DL) {
+    LLVMContext &Ctx = M.getContext();
+    Type *PtrTy = PointerType::getUnqual(Ctx);
+    Type *SizeTy = DL.getIntPtrType(Ctx);
+    FunctionType *FTy = FunctionType::get(PtrTy, {PtrTy, SizeTy}, false);
+    return M.getOrInsertFunction("mg_intercept_realloc", FTy);
+}
+
+static FunctionCallee getOrInsertInterceptFree(Module &M) {
+    LLVMContext &Ctx = M.getContext();
+    Type *VoidTy = Type::getVoidTy(Ctx);
+    Type *PtrTy = PointerType::getUnqual(Ctx);
+    FunctionType *FTy = FunctionType::get(VoidTy, {PtrTy}, false);
+    return M.getOrInsertFunction("mg_intercept_free", FTy);
+}
+
+/**
+ * @brief Checks if a function belongs to the MemoryGuard runtime.
+ *
+ * Calls within MemoryGuard runtime functions must not be rewritten or instrumented
+ * to prevent infinite recursion. Matches exact runtime API names to avoid excluding
+ * unrelated application functions beginning with "mg_".
+ */
+static bool isMemoryGuardRuntimeFunction(const Function &F) {
+    StringRef Name = F.getName();
+    return Name == "mg_malloc" ||
+           Name == "mg_free" ||
+           Name == "mg_is_tracked" ||
+           Name == "mg_get_allocation_size" ||
+           Name == "mg_get_tracked_count" ||
+           Name == "mg_is_valid_access" ||
+           Name == "mg_check_access" ||
+           Name == "mg_register_external" ||
+           Name == "mg_unregister_external" ||
+           Name == "mg_realloc_external" ||
+           Name == "mg_intercept_malloc" ||
+           Name == "mg_intercept_calloc" ||
+           Name == "mg_intercept_realloc" ||
+           Name == "mg_intercept_free";
+}
+
+/**
+ * @brief Checks if a call instruction represents a compatible standard malloc call.
+ */
+static bool isCompatibleMallocCall(const CallBase *CB, const DataLayout &DL) {
+    Function *Callee = CB->getCalledFunction();
+    if (!Callee || Callee->isIntrinsic()) return false;
+    if (Callee->getCallingConv() != CallingConv::C || CB->getCallingConv() != CallingConv::C) return false;
+    if (Callee->getName() != "malloc") return false;
+    if (CB->arg_size() != 1) return false;
+    if (!CB->getType()->isPointerTy()) return false;
+    Type *ArgTy = CB->getArgOperand(0)->getType();
+    if (!ArgTy->isIntegerTy()) return false;
+    Type *SizeTy = DL.getIntPtrType(CB->getContext());
+    if (ArgTy != SizeTy) return false;
+    return true;
+}
+
+/**
+ * @brief Checks if a call instruction represents a compatible standard calloc call.
+ */
+static bool isCompatibleCallocCall(const CallBase *CB, const DataLayout &DL) {
+    Function *Callee = CB->getCalledFunction();
+    if (!Callee || Callee->isIntrinsic()) return false;
+    if (Callee->getCallingConv() != CallingConv::C || CB->getCallingConv() != CallingConv::C) return false;
+    if (Callee->getName() != "calloc") return false;
+    if (CB->arg_size() != 2) return false;
+    if (!CB->getType()->isPointerTy()) return false;
+    Type *SizeTy = DL.getIntPtrType(CB->getContext());
+    if (CB->getArgOperand(0)->getType() != SizeTy) return false;
+    if (CB->getArgOperand(1)->getType() != SizeTy) return false;
+    return true;
+}
+
+/**
+ * @brief Checks if a call instruction represents a compatible standard realloc call.
+ */
+static bool isCompatibleReallocCall(const CallBase *CB, const DataLayout &DL) {
+    Function *Callee = CB->getCalledFunction();
+    if (!Callee || Callee->isIntrinsic()) return false;
+    if (Callee->getCallingConv() != CallingConv::C || CB->getCallingConv() != CallingConv::C) return false;
+    if (Callee->getName() != "realloc") return false;
+    if (CB->arg_size() != 2) return false;
+    if (!CB->getType()->isPointerTy()) return false;
+    if (!CB->getArgOperand(0)->getType()->isPointerTy()) return false;
+    Type *SizeTy = DL.getIntPtrType(CB->getContext());
+    if (CB->getArgOperand(1)->getType() != SizeTy) return false;
+    return true;
+}
+
+/**
+ * @brief Checks if a call instruction represents a compatible standard free call.
+ */
+static bool isCompatibleFreeCall(const CallBase *CB) {
+    Function *Callee = CB->getCalledFunction();
+    if (!Callee || Callee->isIntrinsic()) return false;
+    if (Callee->getCallingConv() != CallingConv::C || CB->getCallingConv() != CallingConv::C) return false;
+    if (Callee->getName() != "free") return false;
+    if (CB->arg_size() != 1) return false;
+    if (!CB->getType()->isVoidTy()) return false;
+    if (!CB->getArgOperand(0)->getType()->isPointerTy()) return false;
+    return true;
+}
+
 /**
  * @brief Checks if a memory access instruction has already been instrumented.
  *
@@ -380,7 +501,7 @@ static bool isAlreadyInstrumented(const Instruction *I, const Value *Ptr, uint64
 class MemoryGuardPass : public PassInfoMixin<MemoryGuardPass> {
 public:
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
-        if (F.isDeclaration()) {
+        if (F.isDeclaration() || isMemoryGuardRuntimeFunction(F)) {
             return PreservedAnalyses::all();
         }
 
@@ -388,6 +509,14 @@ public:
 
         const DataLayout &DL = F.getParent()->getDataLayout();
         DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+        Module *M = F.getParent();
+
+        enum class RewriteKind { MALLOC, CALLOC, REALLOC, FREE };
+        struct CallRewriteSite {
+            CallBase *CB;
+            RewriteKind Kind;
+        };
+        SmallVector<CallRewriteSite, 8> CallsToRewrite;
 
         struct InstrumentationSite {
             Instruction *Inst;
@@ -400,6 +529,15 @@ public:
             for (Instruction &I : BB) {
                 if (auto *CB = dyn_cast<CallBase>(&I)) {
                     analyzeAllocation(F, CB);
+                    if (isCompatibleMallocCall(CB, DL)) {
+                        CallsToRewrite.push_back({CB, RewriteKind::MALLOC});
+                    } else if (isCompatibleCallocCall(CB, DL)) {
+                        CallsToRewrite.push_back({CB, RewriteKind::CALLOC});
+                    } else if (isCompatibleReallocCall(CB, DL)) {
+                        CallsToRewrite.push_back({CB, RewriteKind::REALLOC});
+                    } else if (isCompatibleFreeCall(CB)) {
+                        CallsToRewrite.push_back({CB, RewriteKind::FREE});
+                    }
                 } else if (auto *LI = dyn_cast<LoadInst>(&I)) {
                     Value *Ptr = LI->getPointerOperand();
                     Type *AccessedType = LI->getType();
@@ -464,20 +602,63 @@ public:
             }
         }
 
-        if (SitesToInstrument.empty()) {
-            return PreservedAnalyses::all();
+        bool Modified = false;
+
+        // Perform allocator call-site rewrites
+        for (const auto &Site : CallsToRewrite) {
+            switch (Site.Kind) {
+            case RewriteKind::MALLOC: {
+                FunctionCallee InterceptMalloc = getOrInsertInterceptMalloc(*M, DL);
+                Site.CB->setCalledFunction(InterceptMalloc);
+                Site.CB->removeFnAttr(Attribute::AllocSize);
+                Site.CB->removeFnAttr(Attribute::Builtin);
+                Modified = true;
+                break;
+            }
+            case RewriteKind::CALLOC: {
+                FunctionCallee InterceptCalloc = getOrInsertInterceptCalloc(*M, DL);
+                Site.CB->setCalledFunction(InterceptCalloc);
+                Site.CB->removeFnAttr(Attribute::AllocSize);
+                Site.CB->removeFnAttr(Attribute::Builtin);
+                Modified = true;
+                break;
+            }
+            case RewriteKind::REALLOC: {
+                FunctionCallee InterceptRealloc = getOrInsertInterceptRealloc(*M, DL);
+                Site.CB->setCalledFunction(InterceptRealloc);
+                Site.CB->removeFnAttr(Attribute::AllocSize);
+                Site.CB->removeFnAttr(Attribute::Builtin);
+                Modified = true;
+                break;
+            }
+            case RewriteKind::FREE: {
+                FunctionCallee InterceptFree = getOrInsertInterceptFree(*M);
+                Site.CB->setCalledFunction(InterceptFree);
+                Site.CB->removeFnAttr(Attribute::Builtin);
+                Modified = true;
+                break;
+            }
+            }
         }
 
-        FunctionCallee CheckFn = getOrInsertCheckFunction(*F.getParent(), DL);
-        LLVMContext &Ctx = F.getContext();
-        Type *SizeTy = DL.getIntPtrType(Ctx);
+        // Perform heap check instrumentation
+        if (!SitesToInstrument.empty()) {
+            FunctionCallee CheckFn = getOrInsertCheckFunction(*M, DL);
+            LLVMContext &Ctx = F.getContext();
+            Type *SizeTy = DL.getIntPtrType(Ctx);
 
-        for (const auto &Site : SitesToInstrument) {
-            IRBuilder<> Builder(Site.Inst);
-            Value *SizeVal = ConstantInt::get(SizeTy, Site.AccessSize);
-            CallInst *CheckCall = Builder.CreateCall(CheckFn, {Site.Ptr, SizeVal});
-            CheckCall->setCallingConv(CallingConv::C);
-            Site.Inst->setMetadata("memoryguard.checked", MDNode::get(Ctx, {}));
+            for (const auto &Site : SitesToInstrument) {
+                IRBuilder<> Builder(Site.Inst);
+                Value *SizeVal = ConstantInt::get(SizeTy, Site.AccessSize);
+                CallInst *CheckCall = Builder.CreateCall(CheckFn, {Site.Ptr, SizeVal});
+                CheckCall->setCallingConv(CallingConv::C);
+                Site.Inst->setMetadata("memoryguard.checked", MDNode::get(Ctx, {}));
+            }
+            Modified = true;
+        }
+
+        if (!Modified) {
+            return PreservedAnalyses::all();
         }
 
         PreservedAnalyses PA;
@@ -507,14 +688,14 @@ private:
 
         StringRef CalleeName = Callee->getName();
 
-        if (CalleeName == "malloc") {
+        if (CalleeName == "malloc" || CalleeName == "mg_malloc" || CalleeName == "mg_intercept_malloc") {
             if (CB->arg_size() != 1) {
                 return;
             }
             Value *SizeArg = CB->getArgOperand(0);
 
             errs() << "  [ALLOC] function=" << F.getName()
-                   << " api=malloc ptr=";
+                   << " api=" << CalleeName << " ptr=";
             CB->printAsOperand(errs(), false);
             errs() << " size=";
             if (auto *CI = dyn_cast<ConstantInt>(SizeArg)) {
@@ -524,7 +705,7 @@ private:
                 SizeArg->printAsOperand(errs(), false);
                 errs() << ")\n";
             }
-        } else if (CalleeName == "calloc") {
+        } else if (CalleeName == "calloc" || CalleeName == "mg_intercept_calloc") {
             if (CB->arg_size() != 2) {
                 return;
             }
@@ -532,7 +713,7 @@ private:
             Value *SizeArg = CB->getArgOperand(1);
 
             errs() << "  [ALLOC] function=" << F.getName()
-                   << " api=calloc ptr=";
+                   << " api=" << CalleeName << " ptr=";
             CB->printAsOperand(errs(), false);
             errs() << " size=";
 
@@ -557,7 +738,7 @@ private:
                 SizeArg->printAsOperand(errs(), false);
                 errs() << ")\n";
             }
-        } else if (CalleeName == "realloc") {
+        } else if (CalleeName == "realloc" || CalleeName == "mg_intercept_realloc") {
             if (CB->arg_size() != 2) {
                 return;
             }
@@ -565,7 +746,7 @@ private:
             Value *SizeArg = CB->getArgOperand(1);
 
             errs() << "  [ALLOC] function=" << F.getName()
-                   << " api=realloc ptr=";
+                   << " api=" << CalleeName << " ptr=";
             CB->printAsOperand(errs(), false);
             errs() << " old_ptr=";
             OldPtr->printAsOperand(errs(), false);
