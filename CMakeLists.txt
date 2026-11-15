@@ -95,3 +95,16 @@ if(CLANG_TOOL AND OPT_TOOL AND LLVM_LINK_TOOL)
     add_test(NAME test_instrumentation COMMAND ${CMAKE_CURRENT_BINARY_DIR}/test_instrumentation_bin)
 endif()
 
+# Find Python 3 to run automated LLVM IR inspection tests
+find_package(Python3 COMPONENTS Interpreter)
+
+if(Python3_FOUND AND OPT_TOOL)
+    add_test(
+        NAME test_ir_inspection
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_transformed_ir_inspection.py
+                ${OPT_TOOL} $<TARGET_FILE:MemoryGuardPass>
+                ${CMAKE_CURRENT_SOURCE_DIR}/examples/test_negative_cases.ll
+    )
+endif()
+
+

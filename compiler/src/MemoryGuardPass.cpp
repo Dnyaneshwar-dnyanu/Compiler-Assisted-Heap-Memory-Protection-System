@@ -100,7 +100,7 @@ static bool isHeapAllocCall(const Value *V) {
         return false;
     }
     Function *Callee = CB->getCalledFunction();
-    if (!Callee || Callee->isIntrinsic()) {
+    if (!Callee || Callee->isIntrinsic() || Callee->isVarArg()) {
         return false;
     }
     if (!CB->getType()->isPointerTy()) {
@@ -726,10 +726,10 @@ static PointerOrigin tracePointerOrigin(const Value *V,
         return tracePointerOrigin(GEP->getPointerOperand(), DT, Visited, Depth + 1, ICtx);
     }
 
-    // 8. Pointer casts: follow safe pointer-preserving casts only.
-    // Return UNKNOWN for PtrToInt, IntToPtr, or other unsafe conversions.
+    // 8. Pointer casts: follow safe pointer-preserving casts only (BitCast).
+    // Return UNKNOWN for PtrToInt, IntToPtr, AddrSpaceCast, or other unsafe conversions.
     if (auto *Cast = dyn_cast<CastInst>(V)) {
-        if (isa<BitCastInst>(Cast) || isa<AddrSpaceCastInst>(Cast)) {
+        if (isa<BitCastInst>(Cast)) {
             return tracePointerOrigin(Cast->getOperand(0), DT, Visited, Depth + 1, ICtx);
         }
         return PointerOrigin::UNKNOWN;
@@ -740,11 +740,10 @@ static PointerOrigin tracePointerOrigin(const Value *V,
         return tracePointerOrigin(FI->getOperand(0), DT, Visited, Depth + 1, ICtx);
     }
 
-    // 10. Constant expressions (GEP, safe pointer casts, or select)
+    // 10. Constant expressions (GEP, safe pointer bitcast, or select)
     if (auto *CE = dyn_cast<ConstantExpr>(V)) {
         if (CE->getOpcode() == Instruction::GetElementPtr ||
-            CE->getOpcode() == Instruction::BitCast ||
-            CE->getOpcode() == Instruction::AddrSpaceCast) {
+            CE->getOpcode() == Instruction::BitCast) {
             return tracePointerOrigin(CE->getOperand(0), DT, Visited, Depth + 1, ICtx);
         }
         if (CE->getOpcode() == Instruction::Select) {
@@ -886,7 +885,7 @@ static FunctionCallee getOrInsertInterceptFree(Module &M) {
  */
 static bool isCompatibleMallocCall(const CallBase *CB, const DataLayout &DL) {
     Function *Callee = CB->getCalledFunction();
-    if (!Callee || Callee->isIntrinsic()) return false;
+    if (!Callee || Callee->isIntrinsic() || Callee->isVarArg()) return false;
     if (Callee->getCallingConv() != CallingConv::C || CB->getCallingConv() != CallingConv::C) return false;
     if (Callee->getName() != "malloc") return false;
     if (CB->arg_size() != 1) return false;
@@ -903,7 +902,7 @@ static bool isCompatibleMallocCall(const CallBase *CB, const DataLayout &DL) {
  */
 static bool isCompatibleCallocCall(const CallBase *CB, const DataLayout &DL) {
     Function *Callee = CB->getCalledFunction();
-    if (!Callee || Callee->isIntrinsic()) return false;
+    if (!Callee || Callee->isIntrinsic() || Callee->isVarArg()) return false;
     if (Callee->getCallingConv() != CallingConv::C || CB->getCallingConv() != CallingConv::C) return false;
     if (Callee->getName() != "calloc") return false;
     if (CB->arg_size() != 2) return false;
@@ -919,7 +918,7 @@ static bool isCompatibleCallocCall(const CallBase *CB, const DataLayout &DL) {
  */
 static bool isCompatibleReallocCall(const CallBase *CB, const DataLayout &DL) {
     Function *Callee = CB->getCalledFunction();
-    if (!Callee || Callee->isIntrinsic()) return false;
+    if (!Callee || Callee->isIntrinsic() || Callee->isVarArg()) return false;
     if (Callee->getCallingConv() != CallingConv::C || CB->getCallingConv() != CallingConv::C) return false;
     if (Callee->getName() != "realloc") return false;
     if (CB->arg_size() != 2) return false;
@@ -935,7 +934,7 @@ static bool isCompatibleReallocCall(const CallBase *CB, const DataLayout &DL) {
  */
 static bool isCompatibleFreeCall(const CallBase *CB) {
     Function *Callee = CB->getCalledFunction();
-    if (!Callee || Callee->isIntrinsic()) return false;
+    if (!Callee || Callee->isIntrinsic() || Callee->isVarArg()) return false;
     if (Callee->getCallingConv() != CallingConv::C || CB->getCallingConv() != CallingConv::C) return false;
     if (Callee->getName() != "free") return false;
     if (CB->arg_size() != 1) return false;
@@ -1060,9 +1059,13 @@ public:
                         errs() << " origin=" << originToString(Origin) << "\n";
 
                         // Instrument only HEAP_CANDIDATE load accesses with fixed sizes and standard address space
-                        if (Origin == PointerOrigin::HEAP_CANDIDATE && !StoreSize.isScalable()) {
-                            if (auto *PT = dyn_cast<PointerType>(Ptr->getType())) {
-                                if (PT->getAddressSpace() == 0) {
+                        if (Origin == PointerOrigin::HEAP_CANDIDATE) {
+                            if (StoreSize.isScalable()) {
+                                errs() << "    (skipped: scalable vector memory access unsupported)\n";
+                            } else if (auto *PT = dyn_cast<PointerType>(Ptr->getType())) {
+                                if (PT->getAddressSpace() != 0) {
+                                    errs() << "    (skipped: non-default address space " << PT->getAddressSpace() << " unsupported)\n";
+                                } else {
                                     uint64_t FixedSize = StoreSize.getFixedValue();
                                     if (!isAlreadyInstrumented(LI, Ptr, FixedSize)) {
                                         SitesToInstrument.push_back({LI, Ptr, FixedSize});
@@ -1108,9 +1111,13 @@ public:
                         errs() << " origin=" << originToString(Origin) << "\n";
 
                         // Instrument only HEAP_CANDIDATE store accesses with fixed sizes and standard address space
-                        if (Origin == PointerOrigin::HEAP_CANDIDATE && !StoreSize.isScalable()) {
-                            if (auto *PT = dyn_cast<PointerType>(Ptr->getType())) {
-                                if (PT->getAddressSpace() == 0) {
+                        if (Origin == PointerOrigin::HEAP_CANDIDATE) {
+                            if (StoreSize.isScalable()) {
+                                errs() << "    (skipped: scalable vector memory access unsupported)\n";
+                            } else if (auto *PT = dyn_cast<PointerType>(Ptr->getType())) {
+                                if (PT->getAddressSpace() != 0) {
+                                    errs() << "    (skipped: non-default address space " << PT->getAddressSpace() << " unsupported)\n";
+                                } else {
                                     uint64_t FixedSize = StoreSize.getFixedValue();
                                     if (!isAlreadyInstrumented(SI, Ptr, FixedSize)) {
                                         SitesToInstrument.push_back({SI, Ptr, FixedSize});
@@ -1239,7 +1246,7 @@ public:
 private:
     void analyzeAllocation(const Function &F, const CallBase *CB) {
         Function *Callee = CB->getCalledFunction();
-        if (!Callee || Callee->isIntrinsic()) {
+        if (!Callee || Callee->isIntrinsic() || Callee->isVarArg()) {
             return;
         }
 
