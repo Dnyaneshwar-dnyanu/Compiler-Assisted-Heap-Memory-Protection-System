@@ -74,6 +74,7 @@ if(CLANG_TOOL AND OPT_TOOL AND LLVM_LINK_TOOL)
                 ${CMAKE_CURRENT_BINARY_DIR}/test_instrumentation_c.ll
                 ${CMAKE_CURRENT_SOURCE_DIR}/examples/test_aggregates.ll
                 ${CMAKE_CURRENT_SOURCE_DIR}/examples/test_atomic_volatile.ll
+                ${CMAKE_CURRENT_SOURCE_DIR}/examples/test_advanced_regression.ll
                 -S -o ${CMAKE_CURRENT_BINARY_DIR}/test_instrumentation.ll
         COMMAND ${OPT_TOOL} -load-pass-plugin=$<TARGET_FILE:MemoryGuardPass>
                 -passes=memoryguard
@@ -83,7 +84,7 @@ if(CLANG_TOOL AND OPT_TOOL AND LLVM_LINK_TOOL)
                 $<TARGET_FILE:memoryguard>
                 -pthread
                 -o ${CMAKE_CURRENT_BINARY_DIR}/test_instrumentation_bin
-        DEPENDS examples/test_instrumentation.c examples/test_aggregates.ll examples/test_atomic_volatile.ll MemoryGuardPass memoryguard
+        DEPENDS examples/test_instrumentation.c examples/test_aggregates.ll examples/test_atomic_volatile.ll examples/test_advanced_regression.ll MemoryGuardPass memoryguard
         COMMENT "Compiling, instrumenting, and linking end-to-end integration test"
     )
 
