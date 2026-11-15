@@ -113,5 +113,53 @@ if(Python3_FOUND AND OPT_TOOL)
     )
 endif()
 
+# =========================================================================
+# Step 18: Performance Benchmarks
+# =========================================================================
+
+# Build uninstrumented baseline benchmark executable (-O2)
+add_executable(benchmark_baseline
+    benchmarks/benchmark_suite.c
+)
+target_compile_options(benchmark_baseline PRIVATE -O2)
+target_link_libraries(benchmark_baseline PRIVATE Threads::Threads -lm)
+
+# Build instrumented benchmark executable using MemoryGuard pass and runtime (-O2)
+if(CLANG_TOOL AND OPT_TOOL)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/benchmark_instrumented
+        COMMAND ${CLANG_TOOL} -O2 -emit-llvm -S
+                ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/benchmark_suite.c
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/runtime/include
+                -o ${CMAKE_CURRENT_BINARY_DIR}/benchmark_suite.ll
+        COMMAND ${OPT_TOOL} -load-pass-plugin=$<TARGET_FILE:MemoryGuardPass>
+                -passes=memoryguard
+                -S ${CMAKE_CURRENT_BINARY_DIR}/benchmark_suite.ll
+                -o ${CMAKE_CURRENT_BINARY_DIR}/benchmark_suite_inst.ll
+        COMMAND ${CLANG_TOOL} -O2
+                ${CMAKE_CURRENT_BINARY_DIR}/benchmark_suite_inst.ll
+                $<TARGET_FILE:memoryguard>
+                -pthread -lm
+                -o ${CMAKE_CURRENT_BINARY_DIR}/benchmark_instrumented
+        DEPENDS benchmarks/benchmark_suite.c MemoryGuardPass memoryguard
+        COMMENT "Compiling and instrumenting benchmark suite with MemoryGuard pass"
+    )
+
+    add_custom_target(build_benchmark_instrumented ALL
+        DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/benchmark_instrumented
+    )
+
+    if(Python3_FOUND)
+        add_test(
+            NAME test_benchmark_correctness
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/run_benchmarks.py
+                    --baseline ${CMAKE_CURRENT_BINARY_DIR}/benchmark_baseline
+                    --instrumented ${CMAKE_CURRENT_BINARY_DIR}/benchmark_instrumented
+                    --quick
+        )
+    endif()
+endif()
+
+
 
 
