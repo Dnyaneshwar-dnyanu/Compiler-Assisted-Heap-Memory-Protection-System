@@ -346,6 +346,18 @@ extern void mg_test_aggregate_mixed(void);
 extern void mg_test_pointer_cast_valid(void);
 extern void mg_test_pointer_cast_oob(void);
 
+/* ========================================================================= */
+/* Step 13: Atomic and Volatile Memory Access Handling                        */
+/* ========================================================================= */
+
+extern void mg_test_volatile_heap_valid(void);
+extern void mg_test_volatile_heap_oob(void);
+extern void mg_test_atomic_load_store(void);
+extern void mg_test_atomic_rmw(void);
+extern void mg_test_atomic_cmpxchg(void);
+extern void mg_test_atomic_fence(void);
+extern void mg_test_atomic_unknown_origin(void);
+
 static int run_in_child(void (*fn)(void)) {
     fflush(stdout);
     fflush(stderr);
@@ -664,6 +676,74 @@ int main(void) {
         passed++;
     } else {
         printf("  [FAIL] Pointer cast failed (val: %d, oob: %d).\n", st25_val, st25_oob);
+    }
+
+    /* 26. Volatile: Heap-origin volatile read and write (valid & OOB) */
+    total++;
+    printf("[TEST] Heap-origin volatile read and write (valid & OOB)...\n");
+    int st26_val = run_in_child(mg_test_volatile_heap_valid);
+    int st26_oob = run_in_child(mg_test_volatile_heap_oob);
+    if (WIFEXITED(st26_val) && WEXITSTATUS(st26_val) == 0 &&
+        WIFSIGNALED(st26_oob) && WTERMSIG(st26_oob) == SIGABRT) {
+        printf("  [PASS] Volatile heap accesses instrumented and OOB aborted correctly.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Volatile heap test failed (val: %d, oob: %d).\n", st26_val, st26_oob);
+    }
+
+    /* 27. Atomic: Atomic load and store (heap origin, skipped instrumentation) */
+    total++;
+    printf("[TEST] Atomic load and store (skipped for synchronization preservation)...\n");
+    int st27 = run_in_child(mg_test_atomic_load_store);
+    if (WIFEXITED(st27) && WEXITSTATUS(st27) == 0) {
+        printf("  [PASS] Atomic load/store executed with original synchronization semantics.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Atomic load/store test failed (status: %d).\n", st27);
+    }
+
+    /* 28. Atomic: Atomic RMW (heap origin, skipped instrumentation) */
+    total++;
+    printf("[TEST] Atomic RMW operation (skipped for synchronization preservation)...\n");
+    int st28 = run_in_child(mg_test_atomic_rmw);
+    if (WIFEXITED(st28) && WEXITSTATUS(st28) == 0) {
+        printf("  [PASS] Atomic RMW executed with original synchronization semantics.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Atomic RMW test failed (status: %d).\n", st28);
+    }
+
+    /* 29. Atomic: Atomic compare-exchange (heap origin, skipped instrumentation) */
+    total++;
+    printf("[TEST] Atomic compare-exchange (skipped for synchronization preservation)...\n");
+    int st29 = run_in_child(mg_test_atomic_cmpxchg);
+    if (WIFEXITED(st29) && WEXITSTATUS(st29) == 0) {
+        printf("  [PASS] Atomic cmpxchg executed with original synchronization semantics.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Atomic cmpxchg test failed (status: %d).\n", st29);
+    }
+
+    /* 30. Atomic: Atomic fence (skipped, no pointer operand) */
+    total++;
+    printf("[TEST] Atomic fence instructions...\n");
+    int st30 = run_in_child(mg_test_atomic_fence);
+    if (WIFEXITED(st30) && WEXITSTATUS(st30) == 0) {
+        printf("  [PASS] Atomic fence instructions executed normally.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Atomic fence test failed (status: %d).\n", st30);
+    }
+
+    /* 31. Atomic: Unknown-origin atomic pointer (skipped instrumentation) */
+    total++;
+    printf("[TEST] Unknown-origin atomic pointer...\n");
+    int st31 = run_in_child(mg_test_atomic_unknown_origin);
+    if (WIFEXITED(st31) && WEXITSTATUS(st31) == 0) {
+        printf("  [PASS] Unknown-origin atomic accesses executed normally.\n");
+        passed++;
+    } else {
+        printf("  [FAIL] Unknown-origin atomic test failed (status: %d).\n", st31);
     }
 
     printf("====================================================\n");

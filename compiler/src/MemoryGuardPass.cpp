@@ -15,6 +15,7 @@
 #include "llvm/IR/Type.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
+#include "llvm/Support/AtomicOrdering.h"
 #include "llvm/Support/TypeSize.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
@@ -43,6 +44,49 @@ static StringRef originToString(PointerOrigin Origin) {
         return "UNKNOWN";
     }
     return "UNKNOWN";
+}
+
+static StringRef atomicOrderingToString(AtomicOrdering Ordering) {
+    switch (Ordering) {
+    case AtomicOrdering::NotAtomic:
+        return "not_atomic";
+    case AtomicOrdering::Unordered:
+        return "unordered";
+    case AtomicOrdering::Monotonic:
+        return "monotonic";
+    case AtomicOrdering::Acquire:
+        return "acquire";
+    case AtomicOrdering::Release:
+        return "release";
+    case AtomicOrdering::AcquireRelease:
+        return "acq_rel";
+    case AtomicOrdering::SequentiallyConsistent:
+        return "seq_cst";
+    }
+    return "unknown";
+}
+
+static StringRef atomicRMWOpToString(AtomicRMWInst::BinOp Op) {
+    switch (Op) {
+    case AtomicRMWInst::Xchg: return "xchg";
+    case AtomicRMWInst::Add:  return "add";
+    case AtomicRMWInst::Sub:  return "sub";
+    case AtomicRMWInst::And:  return "and";
+    case AtomicRMWInst::Nand: return "nand";
+    case AtomicRMWInst::Or:   return "or";
+    case AtomicRMWInst::Xor:  return "xor";
+    case AtomicRMWInst::Max:  return "max";
+    case AtomicRMWInst::Min:  return "min";
+    case AtomicRMWInst::UMax: return "umax";
+    case AtomicRMWInst::UMin: return "umin";
+    case AtomicRMWInst::FAdd: return "fadd";
+    case AtomicRMWInst::FSub: return "fsub";
+    case AtomicRMWInst::FMax: return "fmax";
+    case AtomicRMWInst::FMin: return "fmin";
+    case AtomicRMWInst::UIncWrap: return "uinc_wrap";
+    case AtomicRMWInst::UDecWrap: return "udec_wrap";
+    default: return "rmw_op";
+    }
 }
 
 /**
@@ -487,6 +531,9 @@ static PointerOrigin traceExtractedValueOrigin(const Value *Agg,
 
     // 6. Load instruction from an alloca storing an aggregate
     if (auto *LI = dyn_cast<LoadInst>(Agg)) {
+        if (LI->isAtomic()) {
+            return PointerOrigin::UNKNOWN;
+        }
         if (auto *AI = dyn_cast<AllocaInst>(LI->getPointerOperand())) {
             SmallVector<const StoreInst *, 4> Stores;
             for (const User *U : AI->users()) {
@@ -495,6 +542,9 @@ static PointerOrigin traceExtractedValueOrigin(const Value *Agg,
                         return PointerOrigin::UNKNOWN;
                     }
                     if (SI->getPointerOperand() == AI) {
+                        if (SI->isAtomic()) {
+                            return PointerOrigin::UNKNOWN;
+                        }
                         Stores.push_back(SI);
                     }
                 } else if (isa<LoadInst>(U) || isa<IntrinsicInst>(U)) {
@@ -562,6 +612,9 @@ static PointerOrigin traceAllocaOrigin(const AllocaInst *AI, const LoadInst *LI,
                 return PointerOrigin::UNKNOWN;
             }
             if (SI->getPointerOperand() == AI) {
+                if (SI->isAtomic()) {
+                    return PointerOrigin::UNKNOWN;
+                }
                 Stores.push_back(SI);
             }
         } else if (isa<LoadInst>(U)) {
@@ -739,6 +792,9 @@ static PointerOrigin tracePointerOrigin(const Value *V,
 
     // 13. Load instructions: conservative local memory tracking with proven dominance
     if (auto *LI = dyn_cast<LoadInst>(V)) {
+        if (LI->isAtomic()) {
+            return PointerOrigin::UNKNOWN;
+        }
         const Value *LoadSource = LI->getPointerOperand();
         if (auto *AI = dyn_cast<AllocaInst>(LoadSource)) {
             return traceAllocaOrigin(AI, LI, DT, Visited, Depth + 1, ICtx);
@@ -973,26 +1029,44 @@ public:
                     TypeSize StoreSize = DL.getTypeStoreSize(AccessedType);
                     PointerOrigin Origin = classifyPointerOrigin(Ptr, &DT, ICtx);
 
-                    errs() << "  [READ]  function=" << F.getName()
-                           << " type=";
-                    AccessedType->print(errs());
-                    errs() << " ptr=";
-                    Ptr->printAsOperand(errs(), false);
-                    errs() << " size=";
-                    if (StoreSize.isScalable()) {
-                        errs() << "scalable (min " << StoreSize.getKnownMinValue() << " bytes)";
+                    if (LI->isAtomic()) {
+                        errs() << "  [ATOMIC READ] function=" << F.getName()
+                               << " type=";
+                        AccessedType->print(errs());
+                        errs() << " ptr=";
+                        Ptr->printAsOperand(errs(), false);
+                        errs() << " size=";
+                        if (StoreSize.isScalable()) {
+                            errs() << "scalable (min " << StoreSize.getKnownMinValue() << " bytes)";
+                        } else {
+                            errs() << StoreSize.getFixedValue() << " bytes";
+                        }
+                        errs() << " ordering=" << atomicOrderingToString(LI->getOrdering())
+                               << " origin=" << originToString(Origin)
+                               << " (skipped: atomic synchronization preservation)\n";
                     } else {
-                        errs() << StoreSize.getFixedValue() << " bytes";
-                    }
-                    errs() << " origin=" << originToString(Origin) << "\n";
+                        errs() << (LI->isVolatile() ? "  [READ] (volatile)" : "  [READ] ")
+                               << " function=" << F.getName()
+                               << " type=";
+                        AccessedType->print(errs());
+                        errs() << " ptr=";
+                        Ptr->printAsOperand(errs(), false);
+                        errs() << " size=";
+                        if (StoreSize.isScalable()) {
+                            errs() << "scalable (min " << StoreSize.getKnownMinValue() << " bytes)";
+                        } else {
+                            errs() << StoreSize.getFixedValue() << " bytes";
+                        }
+                        errs() << " origin=" << originToString(Origin) << "\n";
 
-                    // Instrument only HEAP_CANDIDATE load accesses with fixed sizes and standard address space
-                    if (Origin == PointerOrigin::HEAP_CANDIDATE && !StoreSize.isScalable()) {
-                        if (auto *PT = dyn_cast<PointerType>(Ptr->getType())) {
-                            if (PT->getAddressSpace() == 0) {
-                                uint64_t FixedSize = StoreSize.getFixedValue();
-                                if (!isAlreadyInstrumented(LI, Ptr, FixedSize)) {
-                                    SitesToInstrument.push_back({LI, Ptr, FixedSize});
+                        // Instrument only HEAP_CANDIDATE load accesses with fixed sizes and standard address space
+                        if (Origin == PointerOrigin::HEAP_CANDIDATE && !StoreSize.isScalable()) {
+                            if (auto *PT = dyn_cast<PointerType>(Ptr->getType())) {
+                                if (PT->getAddressSpace() == 0) {
+                                    uint64_t FixedSize = StoreSize.getFixedValue();
+                                    if (!isAlreadyInstrumented(LI, Ptr, FixedSize)) {
+                                        SitesToInstrument.push_back({LI, Ptr, FixedSize});
+                                    }
                                 }
                             }
                         }
@@ -1003,30 +1077,94 @@ public:
                     TypeSize StoreSize = DL.getTypeStoreSize(StoredType);
                     PointerOrigin Origin = classifyPointerOrigin(Ptr, &DT, ICtx);
 
-                    errs() << "  [WRITE] function=" << F.getName()
-                           << " type=";
-                    StoredType->print(errs());
-                    errs() << " ptr=";
-                    Ptr->printAsOperand(errs(), false);
-                    errs() << " size=";
-                    if (StoreSize.isScalable()) {
-                        errs() << "scalable (min " << StoreSize.getKnownMinValue() << " bytes)";
+                    if (SI->isAtomic()) {
+                        errs() << "  [ATOMIC WRITE] function=" << F.getName()
+                               << " type=";
+                        StoredType->print(errs());
+                        errs() << " ptr=";
+                        Ptr->printAsOperand(errs(), false);
+                        errs() << " size=";
+                        if (StoreSize.isScalable()) {
+                            errs() << "scalable (min " << StoreSize.getKnownMinValue() << " bytes)";
+                        } else {
+                            errs() << StoreSize.getFixedValue() << " bytes";
+                        }
+                        errs() << " ordering=" << atomicOrderingToString(SI->getOrdering())
+                               << " origin=" << originToString(Origin)
+                               << " (skipped: atomic synchronization preservation)\n";
                     } else {
-                        errs() << StoreSize.getFixedValue() << " bytes";
-                    }
-                    errs() << " origin=" << originToString(Origin) << "\n";
+                        errs() << (SI->isVolatile() ? "  [WRITE] (volatile)" : "  [WRITE]")
+                               << " function=" << F.getName()
+                               << " type=";
+                        StoredType->print(errs());
+                        errs() << " ptr=";
+                        Ptr->printAsOperand(errs(), false);
+                        errs() << " size=";
+                        if (StoreSize.isScalable()) {
+                            errs() << "scalable (min " << StoreSize.getKnownMinValue() << " bytes)";
+                        } else {
+                            errs() << StoreSize.getFixedValue() << " bytes";
+                        }
+                        errs() << " origin=" << originToString(Origin) << "\n";
 
-                    // Instrument only HEAP_CANDIDATE store accesses with fixed sizes and standard address space
-                    if (Origin == PointerOrigin::HEAP_CANDIDATE && !StoreSize.isScalable()) {
-                        if (auto *PT = dyn_cast<PointerType>(Ptr->getType())) {
-                            if (PT->getAddressSpace() == 0) {
-                                uint64_t FixedSize = StoreSize.getFixedValue();
-                                if (!isAlreadyInstrumented(SI, Ptr, FixedSize)) {
-                                    SitesToInstrument.push_back({SI, Ptr, FixedSize});
+                        // Instrument only HEAP_CANDIDATE store accesses with fixed sizes and standard address space
+                        if (Origin == PointerOrigin::HEAP_CANDIDATE && !StoreSize.isScalable()) {
+                            if (auto *PT = dyn_cast<PointerType>(Ptr->getType())) {
+                                if (PT->getAddressSpace() == 0) {
+                                    uint64_t FixedSize = StoreSize.getFixedValue();
+                                    if (!isAlreadyInstrumented(SI, Ptr, FixedSize)) {
+                                        SitesToInstrument.push_back({SI, Ptr, FixedSize});
+                                    }
                                 }
                             }
                         }
                     }
+                } else if (auto *RMW = dyn_cast<AtomicRMWInst>(&I)) {
+                    Value *Ptr = RMW->getPointerOperand();
+                    Type *ValType = RMW->getValOperand()->getType();
+                    TypeSize ValSize = DL.getTypeStoreSize(ValType);
+                    PointerOrigin Origin = classifyPointerOrigin(Ptr, &DT, ICtx);
+
+                    errs() << "  [ATOMIC RMW] function=" << F.getName()
+                           << " op=" << atomicRMWOpToString(RMW->getOperation())
+                           << " type=";
+                    ValType->print(errs());
+                    errs() << " ptr=";
+                    Ptr->printAsOperand(errs(), false);
+                    errs() << " size=";
+                    if (ValSize.isScalable()) {
+                        errs() << "scalable (min " << ValSize.getKnownMinValue() << " bytes)";
+                    } else {
+                        errs() << ValSize.getFixedValue() << " bytes";
+                    }
+                    errs() << " ordering=" << atomicOrderingToString(RMW->getOrdering())
+                           << " origin=" << originToString(Origin)
+                           << " (skipped: atomic synchronization preservation)\n";
+                } else if (auto *CXI = dyn_cast<AtomicCmpXchgInst>(&I)) {
+                    Value *Ptr = CXI->getPointerOperand();
+                    Type *ValType = CXI->getCompareOperand()->getType();
+                    TypeSize ValSize = DL.getTypeStoreSize(ValType);
+                    PointerOrigin Origin = classifyPointerOrigin(Ptr, &DT, ICtx);
+
+                    errs() << "  [ATOMIC CMPXCHG] function=" << F.getName()
+                           << " type=";
+                    ValType->print(errs());
+                    errs() << " ptr=";
+                    Ptr->printAsOperand(errs(), false);
+                    errs() << " size=";
+                    if (ValSize.isScalable()) {
+                        errs() << "scalable (min " << ValSize.getKnownMinValue() << " bytes)";
+                    } else {
+                        errs() << ValSize.getFixedValue() << " bytes";
+                    }
+                    errs() << " success_ordering=" << atomicOrderingToString(CXI->getSuccessOrdering())
+                           << " failure_ordering=" << atomicOrderingToString(CXI->getFailureOrdering())
+                           << " origin=" << originToString(Origin)
+                           << " (skipped: atomic synchronization preservation)\n";
+                } else if (auto *FI = dyn_cast<FenceInst>(&I)) {
+                    errs() << "  [ATOMIC FENCE] function=" << F.getName()
+                           << " ordering=" << atomicOrderingToString(FI->getOrdering())
+                           << " (skipped: no pointer operand)\n";
                 }
             }
         }
