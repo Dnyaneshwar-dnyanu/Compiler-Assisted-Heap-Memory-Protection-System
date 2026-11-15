@@ -2,7 +2,7 @@
 """
 run_benchmarks.py
 
-Automated benchmark harness for MemoryGuard Step 18.
+Audited & Corrected Benchmark Harness for MemoryGuard Step 18.
 Measures runtime overhead, allocation-registry performance, and instrumentation costs
 against an equivalent uninstrumented baseline across multiple workload sizes.
 """
@@ -11,15 +11,13 @@ import sys
 import os
 import argparse
 import subprocess
-import re
 import csv
 import platform
-import shutil
 
 def parse_result_line(line):
     """
     Parses a line matching:
-    RESULT workload=<name> ops=<ops> runs=<runs> checksum=<hex> min_sec=<sec> median_sec=<sec> avg_sec=<sec> ns_per_op=<ns> ops_per_sec=<ops_sec>
+    RESULT workload=<name> op_type=<type> ops=<ops> batch_count=<K> effective_ops=<total> runs=<runs> checksum=<hex> min_ns=<ns> median_ns=<ns> avg_ns=<ns> sample_duration_ms=<ms> ns_per_op=<ns> ops_per_sec=<ops_sec> reliable=<0/1>
     """
     data = {}
     tokens = line.strip().split()
@@ -31,12 +29,20 @@ def parse_result_line(line):
             data[k] = v
     return data
 
-def run_workload(bin_path, workload, ops, warmup, runs):
-    cmd = [bin_path, workload, str(ops), str(warmup), str(runs)]
+def run_workload(bin_path, workload, ops, warmup, runs, target_duration_ms=100, forced_batch=0):
+    cmd = [
+        bin_path,
+        workload,
+        str(ops),
+        str(warmup),
+        str(runs),
+        str(target_duration_ms),
+        str(forced_batch)
+    ]
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         raise RuntimeError(f"Command failed ({' '.join(cmd)}):\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
-    
+
     for line in res.stdout.splitlines():
         parsed = parse_result_line(line)
         if parsed and parsed.get("workload") == workload:
@@ -56,12 +62,13 @@ def run_registry_benchmark(registry_bin):
     records = []
     current_scale = None
 
+    import re
     for line in res.stdout.splitlines():
         scale_m = re.search(r"Scale:\s+N\s*=\s*(\d+)", line)
         if scale_m:
             current_scale = int(scale_m.group(1))
             continue
-        
+
         lookup_m = re.search(r"Speedup:\s+([0-9.]+)x\s+FASTER with AVL Interval Tree", line)
         if lookup_m and current_scale:
             speedup = float(lookup_m.group(1))
@@ -99,6 +106,7 @@ def main():
     parser.add_argument("--quick", action="store_true", help="Quick run for automated testing / CTest")
     parser.add_argument("--runs", type=int, default=5, help="Number of repetitions per workload (default: 5)")
     parser.add_argument("--warmup", type=int, default=2, help="Number of warm-up runs (default: 2)")
+    parser.add_argument("--target-ms", type=int, default=100, help="Target minimum sample duration in ms (default: 100)")
 
     args = parser.parse_args()
 
@@ -122,6 +130,7 @@ def main():
         scales = [("Small", 1000)]
         runs = 1
         warmup = 1
+        target_ms = 0  # No batching for fast test
     else:
         scales = [
             ("Small", 1000),
@@ -130,15 +139,17 @@ def main():
         ]
         runs = args.runs
         warmup = args.warmup
+        target_ms = args.target_ms
 
     print("================================================================================")
-    print("                MemoryGuard Performance Benchmarking Suite")
+    print("      MemoryGuard Audited Performance Benchmarking Suite")
     print("================================================================================")
-    print(f"Baseline binary:     {args.baseline}")
-    print(f"Instrumented binary: {args.instrumented}")
-    print(f"Workloads:           {', '.join(workloads)}")
-    print(f"Scales:              {', '.join([f'{name} ({ops:,} ops)' for name, ops in scales])}")
-    print(f"Repetitions:         {runs} (warmup: {warmup})")
+    print(f"Baseline binary:       {args.baseline}")
+    print(f"Instrumented binary:   {args.instrumented}")
+    print(f"Workloads:             {', '.join(workloads)}")
+    print(f"Scales:                {', '.join([f'{name} ({ops:,} ops)' for name, ops in scales])}")
+    print(f"Sample Repetitions:    {runs} (warmup: {warmup})")
+    print(f"Target Duration/Sample:{target_ms} ms (auto-batched)")
     print("================================================================================\n")
 
     results = []
@@ -149,38 +160,54 @@ def main():
         for wl in workloads:
             print(f"  [BENCH] {wl:<18} ... ", end="", flush=True)
 
-            base_res = run_workload(args.baseline, wl, ops, warmup, runs)
-            inst_res = run_workload(args.instrumented, wl, ops, warmup, runs)
+            # 1. Run baseline to establish batch count
+            base_res = run_workload(args.baseline, wl, ops, warmup, runs, target_duration_ms=target_ms)
+            forced_batch = int(base_res["batch_count"])
+
+            # 2. Run instrumented with the EXACT SAME batch count for identical work
+            inst_res = run_workload(args.instrumented, wl, ops, warmup, runs, target_duration_ms=0, forced_batch=forced_batch)
 
             base_chk = base_res.get("checksum")
             inst_chk = inst_res.get("checksum")
             chk_match = (base_chk == inst_chk)
 
+            base_ns = int(base_res["median_ns"])
+            inst_ns = int(inst_res["median_ns"])
+            slowdown = (float(inst_ns) / float(base_ns)) if base_ns > 0 else 1.0
+
+            base_dur_ms = float(base_res["sample_duration_ms"])
+            inst_dur_ms = float(inst_res["sample_duration_ms"])
+            is_reliable = (base_res["reliable"] == "1" and inst_res["reliable"] == "1")
+
+            rel_str = "RELIABLE" if is_reliable else "LOW_SAMPLE_DURATION"
+
             if not chk_match:
                 print(f"CHECKSUM MISMATCH! ({base_chk} != {inst_chk})")
                 correctness_failures += 1
             else:
-                base_median = float(base_res["median_sec"])
-                inst_median = float(inst_res["median_sec"])
-                slowdown = (inst_median / base_median) if base_median > 1e-12 else 1.0
-
-                print(f"Base: {base_median*1000.0:7.2f} ms | Inst: {inst_median*1000.0:7.2f} ms | Slowdown: {slowdown:5.2f}x | Checksum: MATCH")
+                print(f"Base: {base_dur_ms:7.2f} ms | Inst: {inst_dur_ms:7.2f} ms | Slowdown: {slowdown:6.2f}x | [{rel_str}] | Checksum: MATCH")
 
             results.append({
                 "workload": wl,
+                "op_type": base_res.get("op_type", "unknown"),
                 "scale_name": scale_name,
                 "ops": ops,
-                "base_min_sec": float(base_res["min_sec"]),
-                "base_median_sec": float(base_res["median_sec"]),
-                "base_avg_sec": float(base_res["avg_sec"]),
+                "batch_count": forced_batch,
+                "effective_ops": int(base_res["effective_ops"]),
+                "base_min_ns": int(base_res["min_ns"]),
+                "base_median_ns": int(base_res["median_ns"]),
+                "base_avg_ns": int(base_res["avg_ns"]),
+                "base_duration_ms": base_dur_ms,
                 "base_ns_per_op": float(base_res["ns_per_op"]),
                 "base_ops_per_sec": float(base_res["ops_per_sec"]),
-                "inst_min_sec": float(inst_res["min_sec"]),
-                "inst_median_sec": float(inst_res["median_sec"]),
-                "inst_avg_sec": float(inst_res["avg_sec"]),
+                "inst_min_ns": int(inst_res["min_ns"]),
+                "inst_median_ns": int(inst_res["median_ns"]),
+                "inst_avg_ns": int(inst_res["avg_ns"]),
+                "inst_duration_ms": inst_dur_ms,
                 "inst_ns_per_op": float(inst_res["ns_per_op"]),
                 "inst_ops_per_sec": float(inst_res["ops_per_sec"]),
-                "slowdown": (float(inst_res["median_sec"]) / float(base_res["median_sec"])) if float(base_res["median_sec"]) > 1e-12 else 1.0,
+                "slowdown": slowdown,
+                "reliable": is_reliable,
                 "checksum": base_chk,
                 "checksum_match": chk_match
             })
@@ -200,10 +227,10 @@ def main():
     # Write CSV
     with open(args.output_csv, "w", newline="") as f:
         fieldnames = [
-            "workload", "scale_name", "ops",
-            "base_min_sec", "base_median_sec", "base_avg_sec", "base_ns_per_op", "base_ops_per_sec",
-            "inst_min_sec", "inst_median_sec", "inst_avg_sec", "inst_ns_per_op", "inst_ops_per_sec",
-            "slowdown", "checksum", "checksum_match"
+            "workload", "op_type", "scale_name", "ops", "batch_count", "effective_ops",
+            "base_min_ns", "base_median_ns", "base_avg_ns", "base_duration_ms", "base_ns_per_op", "base_ops_per_sec",
+            "inst_min_ns", "inst_median_ns", "inst_avg_ns", "inst_duration_ms", "inst_ns_per_op", "inst_ops_per_sec",
+            "slowdown", "reliable", "checksum", "checksum_match"
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -225,7 +252,7 @@ def main():
 
 def generate_markdown_report(report_path, results, reg_records, sys_info, is_quick):
     with open(report_path, "w") as f:
-        f.write("# MemoryGuard Performance Benchmark Report\n\n")
+        f.write("# MemoryGuard Audited Performance Benchmark Report\n\n")
         f.write("This report presents empirical performance measurements comparing an uninstrumented baseline binary against a MemoryGuard-instrumented binary across multiple workload profiles and input scales.\n\n")
 
         f.write("## 1. System & Benchmark Environment\n\n")
@@ -234,40 +261,52 @@ def generate_markdown_report(report_path, results, reg_records, sys_info, is_qui
         f.write(f"- **Compiler**: `{sys_info.get('clang')}`\n")
         f.write(f"- **Optimization Level**: `-O2` (Applied identically to baseline and instrumented binaries)\n")
         f.write(f"- **Synchronization**: Thread-safe with POSIX pthread mutexes\n")
-        f.write(f"- **Timing Mechanism**: Monotonic high-resolution clock (`clock_gettime(CLOCK_MONOTONIC)`)\n")
+        f.write(f"- **Timing Mechanism**: Monotonic high-resolution clock (`clock_gettime(CLOCK_MONOTONIC)`), recorded in integer nanoseconds\n")
+        f.write(f"- **Sample Duration Target**: $\\ge 100$ ms per timing sample via automated workload batching to avoid sub-millisecond timer resolution jitter\n")
         f.write(f"- **Repetitions**: 5 measured runs per workload preceded by warm-up iterations\n\n")
 
-        f.write("## 2. Workload Overhead Analysis\n\n")
-        f.write("| Workload | Scale | Operations | Baseline Median (ms) | Instrumented Median (ms) | Baseline ns/op | Inst ns/op | Throughput (Mops/s) | Slowdown Ratio |\n")
-        f.write("|:---|:---|---:|---:|---:|---:|---:|---:|---:|\n")
+        f.write("## 2. Operation Definitions & Accounting\n\n")
+        f.write("| Workload | Primary Operation Unit | Semantic Meaning |\n")
+        f.write("|:---|:---|:---|\n")
+        f.write("| `malloc_free` | `allocation_lifecycle` | 1 heap allocation cycle (1 malloc + 1 boundary write + 1 boundary read + 1 free) |\n")
+        f.write("| `seq_read_write` | `sequential_rmw` | 1 sequential heap read-modify-write access (1 read + 1 write) |\n")
+        f.write("| `random_access` | `random_rmw` | 1 pseudo-random heap read-modify-write access (1 read + 1 write) |\n")
+        f.write("| `multi_alloc` | `dynamic_lifecycle` | 1 dynamic heap lifecycle transition (either allocation+write or read+free) |\n")
+        f.write("| `interprocedural` | `forwarded_rmw` | 1 forwarded heap read-modify-write access across non-inlined function boundaries |\n")
+        f.write("| `multithreaded` | `concurrent_lifecycle` | 1 concurrent allocation cycle across 4 concurrent worker threads |\n\n")
+
+        f.write("## 3. Workload Performance & Overhead Analysis\n\n")
+        f.write("| Workload | Scale | Nominal Ops | Batch | Effective Ops | Base Duration | Inst Duration | Base ns/op | Inst ns/op | Throughput (Mops/s) | Slowdown | Timing Fidelity |\n")
+        f.write("|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n")
 
         for r in results:
-            base_ms = r["base_median_sec"] * 1000.0
-            inst_ms = r["inst_median_sec"] * 1000.0
+            base_dur = f"{r['base_duration_ms']:.1f} ms"
+            inst_dur = f"{r['inst_duration_ms']:.1f} ms"
             inst_mops = (r["inst_ops_per_sec"] / 1e6)
-            f.write(f"| `{r['workload']}` | {r['scale_name']} | {r['ops']:,} | {base_ms:.3f} | {inst_ms:.3f} | {r['base_ns_per_op']:.1f} | {r['inst_ns_per_op']:.1f} | {inst_mops:.2f} | **{r['slowdown']:.2f}x** |\n")
+            fidelity = "RELIABLE" if r["reliable"] else "LOW_DURATION"
+            f.write(f"| `{r['workload']}` | {r['scale_name']} | {r['ops']:,} | {r['batch_count']} | {r['effective_ops']:,} | {base_dur} | {inst_dur} | {r['base_ns_per_op']:.2f} | {r['inst_ns_per_op']:.2f} | {inst_mops:.2f} | **{r['slowdown']:.2f}x** | `{fidelity}` |\n")
 
-        f.write("\n## 3. Workload Checksum Correctness Verification\n\n")
+        f.write("\n## 4. Workload Checksum Correctness Verification\n\n")
         f.write("To verify that compiler optimizations did not eliminate benchmark operations and that both binaries executed identical algorithmic work, 64-bit output checksums were verified:\n\n")
-        f.write("| Workload | Scale | Baseline Checksum | Instrumented Checksum | Status |\n")
-        f.write("|:---|:---|:---|:---|:---:|\n")
+        f.write("| Workload | Scale | Effective Ops | Baseline Checksum | Instrumented Checksum | Status |\n")
+        f.write("|:---|:---|---:|:---|:---|:---:|\n")
         for r in results:
             status = "PASS" if r["checksum_match"] else "FAIL"
-            f.write(f"| `{r['workload']}` | {r['scale_name']} | `{r['checksum']}` | `{r['checksum']}` | {status} |\n")
+            f.write(f"| `{r['workload']}` | {r['scale_name']} | {r['effective_ops']:,} | `{r['checksum']}` | `{r['checksum']}` | {status} |\n")
 
         if reg_records:
-            f.write("\n## 4. Allocation Registry Microbenchmark: Linked List vs AVL Interval Tree\n\n")
-            f.write("Registry interior-pointer lookup performance across varying active allocation counts ($N$):\n\n")
+            f.write("\n## 5. Allocation Registry Microbenchmark: Linked List vs AVL Interval Tree\n\n")
+            f.write("Interior-pointer lookup performance across varying active allocation counts ($N$):\n\n")
             f.write("| Active Allocations ($N$) | Lookup Speedup (AVL vs List) | Complexity Advantage |\n")
             f.write("|---:|---:|:---|\n")
             for rec in reg_records:
                 f.write(f"| {rec['scale']:,} | **{rec['speedup']:.1f}x** faster | $O(\\log N)$ vs $O(N)$ |\n")
 
-        f.write("\n## 5. Key Findings & Performance Observations\n\n")
-        f.write("1. **Allocator Interception Cost**: `malloc_free` introduces registry insertion and removal overhead ($O(\\log N)$ tree operations under mutex synchronization).\n")
-        f.write("2. **Boundary Validation Overhead**: Sequential and random heap accesses incur an interval-search lookup per memory access. The balanced AVL tree maintains fast lookup times (~15–30 ns per check).\n")
-        f.write("3. **Interprocedural Propagation**: Forwarded heap accesses in helper functions are instrumented seamlessly with consistent safety validation.\n")
-        f.write("4. **Multithreaded Scalability**: Concurrent worker threads access the thread-safe registry with minimal contention due to fast $O(\\log N)$ lock duration.\n")
+        f.write("\n## 6. Audit Findings & Root Cause Analysis\n\n")
+        f.write("1. **Elimination of Non-Escaping Allocations**: In previous uncorrected runs, LLVM `-O2` recognized standard `malloc`/`free` calls without escaping pointers and eliminated allocations in `malloc_free` and `worker_thread`. Adding inline assembly memory barriers (`escape_ptr()`) ensures all allocations and memory accesses remain present in machine code.\n")
+        f.write("2. **Misaligned Operation Accounting in Interprocedural Calls**: Previously, `interprocedural` executed an uncounted internal loop of 128 accesses per iteration, causing apparent high latencies. Normalizing each operation to 1 forwarded read-modify-write access resolves the discrepancy.\n")
+        f.write("3. **Sample Duration Adequacy**: Sub-millisecond samples are susceptible to timer resolution noise and context-switch jitter. Automated batching ensures timing samples last $\\ge 100$ ms for reliable measurement.\n")
+        f.write("4. **Integer Nanosecond Precision**: Measuring in integer nanoseconds using `clock_gettime(CLOCK_MONOTONIC)` eliminates floating-point cancellation errors.\n")
 
 if __name__ == "__main__":
     main()
