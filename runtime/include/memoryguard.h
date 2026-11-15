@@ -231,6 +231,22 @@ void *mg_intercept_realloc(void *ptr, size_t size);
  */
 void mg_intercept_free(void *ptr);
 
+/**
+ * @brief Validates the structural and interval invariants of the internal AVL tree registry.
+ *
+ * Checks:
+ *  - Strict binary search tree ordering on start addresses.
+ *  - Correct allocation end address calculations.
+ *  - Valid AVL height calculations and balance factor (|bf| <= 1).
+ *  - Subtree max_end correctness across all nodes.
+ *  - Consistency between total node count in tree and total_allocations.
+ *
+ * Thread-safe.
+ *
+ * @return int 1 if all invariants hold, 0 otherwise.
+ */
+int mg_verify_tree_invariants(void);
+
 #ifdef __cplusplus
 }
 #endif

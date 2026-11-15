@@ -52,6 +52,12 @@ target_link_libraries(test_allocation PRIVATE memoryguard)
 # Register the test case with CTest
 add_test(NAME test_allocation COMMAND test_allocation)
 
+# Build the registry performance benchmark executable
+add_executable(benchmark_registry
+    runtime/tests/benchmark_registry.c
+)
+target_link_libraries(benchmark_registry PRIVATE memoryguard)
+
 # Find clang, opt, and llvm-link to build and run the end-to-end compiler instrumentation test
 find_program(CLANG_TOOL NAMES clang-18 clang PATHS ${LLVM_TOOLS_BINARY_DIR})
 find_program(OPT_TOOL NAMES opt-18 opt PATHS ${LLVM_TOOLS_BINARY_DIR})

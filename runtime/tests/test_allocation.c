@@ -1182,6 +1182,355 @@ static void test_multithreaded_interceptors(void) {
                 "Registry count perfectly restored after multithreaded interceptor test");
 }
 
+/* --- Test 15: AVL tree invariant verification and randomized churn --- */
+#define CHURN_ALLOC_COUNT 1000
+
+static void test_avl_tree_invariants_and_random_churn(void) {
+    size_t initial_count = mg_get_tracked_count();
+    void *ptrs[CHURN_ALLOC_COUNT];
+    size_t sizes[CHURN_ALLOC_COUNT];
+
+    /* Initial tree invariant on whatever is currently tracked */
+    TEST_ASSERT(mg_verify_tree_invariants() == 1, "Initial AVL tree invariants hold");
+
+    /* 1. Allocate CHURN_ALLOC_COUNT blocks with pseudo-random sizes */
+    uint32_t seed = 123456789;
+    for (int i = 0; i < CHURN_ALLOC_COUNT; i++) {
+        seed = seed * 1664525u + 1013904223u;
+        sizes[i] = 16 + (seed % 1024);
+        ptrs[i] = mg_malloc(sizes[i]);
+        TEST_ASSERT(ptrs[i] != NULL, "Churn malloc succeeded");
+    }
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + CHURN_ALLOC_COUNT, "All churn blocks tracked");
+    TEST_ASSERT(mg_verify_tree_invariants() == 1, "AVL tree invariants hold after batch insertions");
+
+    /* 2. Validate interior pointers for all blocks */
+    for (int i = 0; i < CHURN_ALLOC_COUNT; i++) {
+        seed = seed * 1664525u + 1013904223u;
+        size_t offset = (seed % sizes[i]);
+        size_t acc_len = 1 + (seed % (sizes[i] - offset));
+        char *interior = (char *)ptrs[i] + offset;
+        TEST_ASSERT(mg_is_valid_access(interior, acc_len) == 1, "Interior pointer valid");
+
+        /* Access extending beyond the allocation boundary must be rejected */
+        TEST_ASSERT(mg_is_valid_access(ptrs[i], sizes[i] + 1) == 0, "Access extending beyond boundary rejected");
+        TEST_ASSERT(mg_is_valid_access((char *)ptrs[i] + sizes[i] - 1, 2) == 0, "Access crossing end boundary rejected");
+    }
+
+    /* 3. Reallocate every second block (expand or shrink) */
+    for (int i = 0; i < CHURN_ALLOC_COUNT; i += 2) {
+        seed = seed * 1664525u + 1013904223u;
+        size_t new_sz = 32 + (seed % 2048);
+        void *new_p = mg_realloc_external(ptrs[i], new_sz);
+        TEST_ASSERT(new_p != NULL, "Reallocation succeeded");
+        ptrs[i] = new_p;
+        sizes[i] = new_sz;
+    }
+
+    TEST_ASSERT(mg_verify_tree_invariants() == 1, "AVL tree invariants hold after reallocations");
+
+    /* 4. Free half of the allocations in pseudo-random order */
+    int order[CHURN_ALLOC_COUNT];
+    for (int i = 0; i < CHURN_ALLOC_COUNT; i++) {
+        order[i] = i;
+    }
+    for (int i = CHURN_ALLOC_COUNT - 1; i > 0; i--) {
+        seed = seed * 1664525u + 1013904223u;
+        int j = (int)(seed % (unsigned int)(i + 1));
+        int temp = order[i];
+        order[i] = order[j];
+        order[j] = temp;
+    }
+
+    for (int i = 0; i < CHURN_ALLOC_COUNT / 2; i++) {
+        int idx = order[i];
+        mg_free(ptrs[idx]);
+        ptrs[idx] = NULL;
+    }
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + (CHURN_ALLOC_COUNT / 2), "Half blocks freed");
+    TEST_ASSERT(mg_verify_tree_invariants() == 1, "AVL tree invariants hold after randomized partial deletion");
+
+    /* 5. Free remaining blocks in order */
+    for (int i = CHURN_ALLOC_COUNT / 2; i < CHURN_ALLOC_COUNT; i++) {
+        int idx = order[i];
+        mg_free(ptrs[idx]);
+        ptrs[idx] = NULL;
+    }
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "All churn blocks freed");
+    TEST_ASSERT(mg_verify_tree_invariants() == 1, "AVL tree invariants hold when fully emptied");
+}
+
+/* --- Test 16: Large-scale allocations and random deallocation order --- */
+#define LARGE_SCALE_COUNT 5000
+
+static void test_large_scale_allocations(void) {
+    size_t initial_count = mg_get_tracked_count();
+    void **ptrs = (void **)malloc(LARGE_SCALE_COUNT * sizeof(void *));
+    TEST_ASSERT(ptrs != NULL, "Host memory allocation for pointers succeeded");
+    if (!ptrs) return;
+
+    /* 1. Allocate LARGE_SCALE_COUNT blocks */
+    for (int i = 0; i < LARGE_SCALE_COUNT; i++) {
+        size_t sz = 16 + (size_t)(i % 256);
+        ptrs[i] = mg_malloc(sz);
+        TEST_ASSERT(ptrs[i] != NULL, "Large scale mg_malloc succeeded");
+    }
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + LARGE_SCALE_COUNT, "Tracked count matches 5,000");
+    TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold for 5,000 nodes");
+
+    /* 2. Spot check 500 interior and 500 invalid lookups */
+    for (int i = 0; i < 500; i++) {
+        int idx = (i * 97) % LARGE_SCALE_COUNT;
+        size_t sz = 16 + (size_t)(idx % 256);
+        char *mid = (char *)ptrs[idx] + (sz / 2);
+        TEST_ASSERT(mg_is_valid_access(mid, 1) == 1, "Spot-check interior access valid");
+
+        /* Stack pointer is never tracked in heap */
+        int stack_probe = 0x55AA;
+        TEST_ASSERT(mg_is_valid_access(&stack_probe, sizeof(int)) == 0, "Stack variable access invalid");
+    }
+
+    /* 3. Shuffle and deallocate all 5,000 blocks */
+    uint32_t seed = 987654321;
+    for (int i = LARGE_SCALE_COUNT - 1; i > 0; i--) {
+        seed = seed * 1664525u + 1013904223u;
+        int j = (int)(seed % (unsigned int)(i + 1));
+        void *tmp = ptrs[i];
+        ptrs[i] = ptrs[j];
+        ptrs[j] = tmp;
+    }
+
+    for (int i = 0; i < LARGE_SCALE_COUNT; i++) {
+        mg_free(ptrs[i]);
+        if (i % 1000 == 999) {
+            TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold during progressive deletion");
+        }
+    }
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count restored after large scale test");
+    TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold after all large-scale nodes freed");
+
+    free(ptrs);
+}
+
+/* --- Test 17: Overlapping external allocation ranges --- */
+static void test_overlapping_external_ranges(void) {
+    size_t initial_count = mg_get_tracked_count();
+    char *big_buffer = (char *)malloc(2048);
+    TEST_ASSERT(big_buffer != NULL, "big_buffer allocated");
+    if (!big_buffer) return;
+
+    /*
+     * Register overlapping ranges:
+     * Range A: [0, 800)
+     * Range B: [300, 1200) -> overlaps Range A on [300, 800)
+     * Range C: [1000, 1600) -> overlaps Range B on [1000, 1200)
+     * Range D: [1500, 2000) -> overlaps Range C on [1500, 1600)
+     */
+    void *ptr_a = big_buffer;
+    void *ptr_b = big_buffer + 300;
+    void *ptr_c = big_buffer + 1000;
+    void *ptr_d = big_buffer + 1500;
+
+    TEST_ASSERT(mg_register_external(ptr_a, 800) == 1, "Registered Range A [0, 800)");
+    TEST_ASSERT(mg_register_external(ptr_b, 900) == 1, "Registered Range B [300, 1200)");
+    TEST_ASSERT(mg_register_external(ptr_c, 600) == 1, "Registered Range C [1000, 1600)");
+    TEST_ASSERT(mg_register_external(ptr_d, 500) == 1, "Registered Range D [1500, 2000)");
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count + 4, "4 overlapping ranges registered");
+    TEST_ASSERT(mg_verify_tree_invariants() == 1, "AVL interval tree invariants hold with overlapping ranges");
+
+    /* 1. Interior validations */
+    TEST_ASSERT(mg_is_valid_access(big_buffer + 100, 50) == 1, "Access inside Range A valid");
+    TEST_ASSERT(mg_is_valid_access(big_buffer + 400, 100) == 1, "Access inside Range A and B valid");
+    TEST_ASSERT(mg_is_valid_access(big_buffer + 900, 50) == 1, "Access inside Range B valid");
+    TEST_ASSERT(mg_is_valid_access(big_buffer + 1100, 50) == 1, "Access inside Range B and C valid");
+    TEST_ASSERT(mg_is_valid_access(big_buffer + 1550, 40) == 1, "Access inside Range C and D valid");
+    TEST_ASSERT(mg_is_valid_access(big_buffer + 1800, 50) == 1, "Access inside Range D valid");
+
+    /* 2. Access outside all ranges */
+    TEST_ASSERT(mg_is_valid_access(big_buffer + 2000, 10) == 0, "Access beyond Range D rejected");
+
+    /* 3. Cross-boundary access spanning beyond any single allocation must be rejected */
+    /* [100, 950) spans 850 bytes. Range A only extends to 800. Range B starts at 300. */
+    TEST_ASSERT(mg_is_valid_access(big_buffer + 100, 850) == 0, "Access spanning across ranges rejected");
+
+    /* 4. Unregister Range B: [300, 1200) */
+    TEST_ASSERT(mg_unregister_external(ptr_b) == 1, "Range B unregistered");
+    TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold after unregistering Range B");
+
+    /* [400, 500) is still valid because Range A [0, 800) covers it */
+    TEST_ASSERT(mg_is_valid_access(big_buffer + 400, 100) == 1, "Access still covered by Range A is valid");
+
+    /* [900, 950) was ONLY covered by Range B, so it must now be INVALID */
+    TEST_ASSERT(mg_is_valid_access(big_buffer + 900, 50) == 0, "Access previously in Range B is now invalid");
+
+    /* 5. Clean up remaining ranges */
+    TEST_ASSERT(mg_unregister_external(ptr_a) == 1, "Range A unregistered");
+    TEST_ASSERT(mg_unregister_external(ptr_c) == 1, "Range C unregistered");
+    TEST_ASSERT(mg_unregister_external(ptr_d) == 1, "Range D unregistered");
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "All external ranges cleaned up");
+    TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold after all ranges unregistered");
+
+    free(big_buffer);
+}
+
+/* --- Test 18: Reallocation address relocation stress --- */
+#define RELOC_COUNT 200
+
+static void test_realloc_address_relocation_stress(void) {
+    size_t initial_count = mg_get_tracked_count();
+    void *ptrs[RELOC_COUNT];
+    size_t original_sizes[RELOC_COUNT];
+
+    /* 1. Allocate initial small blocks and fill with distinctive patterns */
+    for (int i = 0; i < RELOC_COUNT; i++) {
+        original_sizes[i] = 32 + (size_t)(i % 64);
+        ptrs[i] = mg_malloc(original_sizes[i]);
+        TEST_ASSERT(ptrs[i] != NULL, "Initial alloc succeeded");
+        memset(ptrs[i], (unsigned char)(i & 0xFF), original_sizes[i]);
+    }
+
+    TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold before realloc relocations");
+
+    /* 2. Reallocate to significantly larger sizes to force memory relocation */
+    int relocations_observed = 0;
+    for (int i = 0; i < RELOC_COUNT; i++) {
+        void *old_p = ptrs[i];
+        size_t new_sz = 8192 + (size_t)(i * 32);
+        void *new_p = mg_realloc_external(old_p, new_sz);
+        TEST_ASSERT(new_p != NULL, "Realloc relocation succeeded");
+
+        if (new_p != old_p) {
+            relocations_observed++;
+            /* The old pointer must no longer be tracked */
+            TEST_ASSERT(mg_is_tracked(old_p) == 0, "Old pointer no longer tracked after relocation");
+        }
+
+        /* Verify data preservation */
+        unsigned char *bytes = (unsigned char *)new_p;
+        int preserved = 1;
+        for (size_t b = 0; b < original_sizes[i]; b++) {
+            if (bytes[b] != (unsigned char)(i & 0xFF)) {
+                preserved = 0;
+                break;
+            }
+        }
+        TEST_ASSERT(preserved == 1, "Payload data intact after relocation");
+
+        /* Verify new bounds and interior access */
+        TEST_ASSERT(mg_is_tracked(new_p) == 1, "New pointer is tracked");
+        TEST_ASSERT(mg_get_allocation_size(new_p) == new_sz, "New size recorded");
+        TEST_ASSERT(mg_is_valid_access((char *)new_p + new_sz - 1, 1) == 1, "Access at new boundary valid");
+        TEST_ASSERT(mg_is_valid_access((char *)new_p + new_sz, 1) == 0, "Access past new boundary rejected");
+
+        ptrs[i] = new_p;
+    }
+
+    TEST_ASSERT(relocations_observed > 0, "Observed at least one actual pointer relocation");
+    TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold after all relocations");
+
+    /* 3. Reallocate back down to small sizes */
+    for (int i = 0; i < RELOC_COUNT; i++) {
+        size_t shrink_sz = 16 + (size_t)(i % 16);
+        void *shrunk = mg_realloc_external(ptrs[i], shrink_sz);
+        TEST_ASSERT(shrunk != NULL, "Realloc shrink succeeded");
+        TEST_ASSERT(mg_get_allocation_size(shrunk) == shrink_sz, "Shrunk size recorded");
+        ptrs[i] = shrunk;
+    }
+
+    TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold after shrink reallocations");
+
+    /* 4. Clean up all blocks */
+    for (int i = 0; i < RELOC_COUNT; i++) {
+        mg_free(ptrs[i]);
+    }
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count restored after relocation test");
+    TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold when emptied");
+}
+
+/* --- Test 19: Multithreaded concurrent tree stress --- */
+#define STRESS_THREADS 16
+#define STRESS_ITERS 50
+
+static void *thread_worker_tree_stress(void *arg_ptr) {
+    ThreadTestArg *arg = (ThreadTestArg *)arg_ptr;
+    uint32_t seed = 54321 + (uint32_t)arg->thread_id * 7919;
+
+    for (int iter = 0; iter < STRESS_ITERS; iter++) {
+        seed = seed * 1664525u + 1013904223u;
+        size_t sz = 24 + (seed % 128);
+
+        /* 1. Malloc and verify */
+        void *p = mg_malloc(sz);
+        THREAD_ASSERT(arg, p != NULL, "Stress malloc returned non-NULL");
+        if (p) {
+            THREAD_ASSERT(arg, mg_is_tracked(p) == 1, "Allocated buffer is tracked");
+            THREAD_ASSERT(arg, mg_is_valid_access(p, sz) == 1, "Full range access valid");
+            THREAD_ASSERT(arg, mg_is_valid_access((char *)p + (sz / 2), 1) == 1, "Midpoint access valid");
+
+            /* 2. Realloc */
+            size_t new_sz = sz * 2;
+            void *rp = mg_realloc_external(p, new_sz);
+            THREAD_ASSERT(arg, rp != NULL, "Stress realloc returned non-NULL");
+            if (rp) {
+                THREAD_ASSERT(arg, mg_is_tracked(rp) == 1, "Reallocated buffer tracked");
+                THREAD_ASSERT(arg, mg_is_valid_access(rp, new_sz) == 1, "New full range valid");
+                mg_free(rp);
+                THREAD_ASSERT(arg, mg_is_tracked(rp) == 0, "Buffer untracked after free");
+            } else {
+                mg_free(p);
+            }
+        }
+
+        /* 3. Register external buffer */
+        char ext_buf[64];
+        if (mg_register_external(ext_buf, sizeof(ext_buf))) {
+            THREAD_ASSERT(arg, mg_is_tracked(ext_buf) == 1, "External buffer tracked");
+            THREAD_ASSERT(arg, mg_is_valid_access(ext_buf + 10, 20) == 1, "External interior valid");
+            mg_unregister_external(ext_buf);
+            THREAD_ASSERT(arg, mg_is_tracked(ext_buf) == 0, "External buffer unregistered");
+        }
+
+        /* 4. Invariant check */
+        if (iter % 10 == 0) {
+            THREAD_ASSERT(arg, mg_verify_tree_invariants() == 1, "Tree invariants hold concurrently");
+        }
+    }
+
+    return NULL;
+}
+
+static void test_multithreaded_concurrent_tree_stress(void) {
+    size_t initial_count = mg_get_tracked_count();
+    pthread_t threads[STRESS_THREADS];
+    ThreadTestArg thread_args[STRESS_THREADS];
+
+    for (int i = 0; i < STRESS_THREADS; i++) {
+        thread_args[i].thread_id = i;
+        thread_args[i].assertions = 0;
+        thread_args[i].failures = 0;
+        pthread_create(&threads[i], NULL, thread_worker_tree_stress, &thread_args[i]);
+    }
+
+    for (int i = 0; i < STRESS_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+        total_assertions += thread_args[i].assertions;
+        failed_assertions += thread_args[i].failures;
+    }
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count,
+                "Registry count restored after multithreaded tree stress");
+    TEST_ASSERT(mg_verify_tree_invariants() == 1,
+                "Tree invariants hold after multithreaded stress test completes");
+}
+
 int main(void) {
     printf("========================================\n");
     printf("  MemoryGuard Allocation Registry Tests \n");
@@ -1201,6 +1550,11 @@ int main(void) {
     RUN_TEST(test_multithreaded_external_and_realloc);
     RUN_TEST(test_multithreaded_concurrent_readers_writers);
     RUN_TEST(test_multithreaded_interceptors);
+    RUN_TEST(test_avl_tree_invariants_and_random_churn);
+    RUN_TEST(test_large_scale_allocations);
+    RUN_TEST(test_overlapping_external_ranges);
+    RUN_TEST(test_realloc_address_relocation_stress);
+    RUN_TEST(test_multithreaded_concurrent_tree_stress);
 
     printf("========================================\n");
     printf("Summary: %d assertions, %d failed\n", total_assertions, failed_assertions);
