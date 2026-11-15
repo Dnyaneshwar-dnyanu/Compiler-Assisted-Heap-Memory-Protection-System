@@ -10,3 +10,6 @@ cmake-build-*/
 
 # Executables
 allocation_test
+
+#plans
+memoryguard_roadmap.md

@@ -34,7 +34,7 @@ enum class PointerOrigin {
     UNKNOWN
 };
 
-static StringRef originToString(PointerOrigin Origin) {
+[[maybe_unused]] static StringRef originToString(PointerOrigin Origin) {
     switch (Origin) {
     case PointerOrigin::HEAP_CANDIDATE:
         return "HEAP_CANDIDATE";
@@ -972,41 +972,164 @@ static bool isAlreadyInstrumented(const Instruction *I, const Value *Ptr, uint64
 }
 
 /**
- * @brief MemoryGuard Function Pass for analyzing LLVM memory operations and heap allocations.
+ * @brief Analysis statistics counters for MemoryGuard diagnostics.
+ */
+struct AnalysisStats {
+    uint64_t TotalAccessesExamined = 0;        // Total load and store instructions examined
+    uint64_t HeapAccessesIdentified = 0;       // Heap-origin accesses identified
+    uint64_t ChecksInserted = 0;               // Runtime checks inserted
+    uint64_t VolatileAccessesInstrumented = 0; // Volatile accesses instrumented
+    uint64_t NonHeapAccessesSkipped = 0;       // Non-heap accesses skipped
+    uint64_t UnknownAccessesSkipped = 0;       // Unknown-origin accesses skipped
+    uint64_t AtomicOperationsSkipped = 0;      // Atomic operations skipped
+    uint64_t UnsupportedAddrSpaceSkipped = 0;  // Unsupported address-space accesses skipped
+    uint64_t ScalableVectorSkipped = 0;        // Scalable-vector accesses skipped
+    uint64_t AllocatorsRewritten = 0;          // Allocator calls detected and successfully rewritten
+    uint64_t IncompatibleAllocatorsSkipped = 0;// Incompatible or unsupported allocator calls skipped
+
+    uint64_t totalUnsupportedSkipped() const {
+        return AtomicOperationsSkipped + ScalableVectorSkipped +
+               UnsupportedAddrSpaceSkipped + IncompatibleAllocatorsSkipped;
+    }
+
+    void add(const AnalysisStats &Other) {
+        TotalAccessesExamined += Other.TotalAccessesExamined;
+        HeapAccessesIdentified += Other.HeapAccessesIdentified;
+        ChecksInserted += Other.ChecksInserted;
+        VolatileAccessesInstrumented += Other.VolatileAccessesInstrumented;
+        NonHeapAccessesSkipped += Other.NonHeapAccessesSkipped;
+        UnknownAccessesSkipped += Other.UnknownAccessesSkipped;
+        AtomicOperationsSkipped += Other.AtomicOperationsSkipped;
+        UnsupportedAddrSpaceSkipped += Other.UnsupportedAddrSpaceSkipped;
+        ScalableVectorSkipped += Other.ScalableVectorSkipped;
+        AllocatorsRewritten += Other.AllocatorsRewritten;
+        IncompatibleAllocatorsSkipped += Other.IncompatibleAllocatorsSkipped;
+    }
+};
+
+/**
+ * @brief Checks if a call base represents an allocator function candidate.
+ */
+static bool isAllocatorCandidate(const CallBase *CB) {
+    if (const Function *Callee = CB->getCalledFunction()) {
+        StringRef Name = Callee->getName();
+        if (Name == "malloc" || Name == "calloc" || Name == "realloc" || Name == "free" ||
+            Name.starts_with("variadic_malloc") || Name.starts_with("variadic_free") ||
+            Name.starts_with("variadic_") ||
+            (Name.contains("malloc") && !Name.starts_with("mg_")) ||
+            (Name.contains("calloc") && !Name.starts_with("mg_")) ||
+            (Name.contains("realloc") && !Name.starts_with("mg_")) ||
+            (Name.contains("free") && !Name.starts_with("mg_") && !Name.contains("freeze"))) {
+            return true;
+        }
+    } else if (CB->isIndirectCall()) {
+        Value *CalledOp = CB->getCalledOperand();
+        if (CalledOp && (CalledOp->getName().contains("alloc") ||
+                         CalledOp->getName().contains("malloc") ||
+                         CalledOp->getName().contains("free"))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void printFunctionSummary(StringRef FuncName, const AnalysisStats &Stats) {
+    errs() << "[MemoryGuard][Function] @" << FuncName << ":\n";
+    errs() << "  Accesses examined:               " << Stats.TotalAccessesExamined << "\n";
+    errs() << "  Checks inserted:                 " << Stats.ChecksInserted << "\n";
+    errs() << "  Heap accesses identified:        " << Stats.HeapAccessesIdentified << "\n";
+    errs() << "  Non-heap accesses skipped:       " << Stats.NonHeapAccessesSkipped << "\n";
+    errs() << "  Unknown-origin accesses skipped: " << Stats.UnknownAccessesSkipped << "\n";
+    errs() << "  Unsupported operations skipped:  " << Stats.totalUnsupportedSkipped() << "\n";
+}
+
+static void printModuleSummary(const AnalysisStats &Stats) {
+    errs() << "[MemoryGuard][Summary] Module Analysis Summary:\n";
+    errs() << "  Total load and store instructions examined:         " << Stats.TotalAccessesExamined << "\n";
+    errs() << "  Heap-origin accesses identified:                    " << Stats.HeapAccessesIdentified << "\n";
+    errs() << "  Runtime checks inserted:                            " << Stats.ChecksInserted << "\n";
+    errs() << "  Volatile accesses instrumented:                     " << Stats.VolatileAccessesInstrumented << "\n";
+    errs() << "  Non-heap accesses skipped:                          " << Stats.NonHeapAccessesSkipped << "\n";
+    errs() << "  Unknown-origin accesses skipped:                    " << Stats.UnknownAccessesSkipped << "\n";
+    errs() << "  Atomic operations skipped:                          " << Stats.AtomicOperationsSkipped << "\n";
+    errs() << "  Unsupported address-space accesses skipped:         " << Stats.UnsupportedAddrSpaceSkipped << "\n";
+    errs() << "  Scalable-vector accesses skipped:                   " << Stats.ScalableVectorSkipped << "\n";
+    errs() << "  Allocator calls detected and successfully rewritten: " << Stats.AllocatorsRewritten << "\n";
+    errs() << "  Incompatible or unsupported allocator calls skipped: " << Stats.IncompatibleAllocatorsSkipped << "\n";
+}
+
+/**
+ * @brief MemoryGuard Module Pass for analyzing LLVM memory operations and heap allocations.
  *
- * Inspects each function for:
- *  1. Heap allocation API calls (malloc, calloc, realloc).
+ * Inspects each function in the module for:
+ *  1. Heap allocation API calls (malloc, calloc, realloc, free) and rewrites them to interceptors.
  *  2. Memory access instructions (LoadInst and StoreInst) with pointer-origin classification.
  *  3. Instruments HEAP_CANDIDATE memory accesses with runtime boundary validation checks.
+ *  4. Collects and reports per-function and module-level analysis summaries.
  */
 class MemoryGuardPass : public PassInfoMixin<MemoryGuardPass> {
 public:
-    PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
-        if (F.isDeclaration() || isMemoryGuardRuntimeFunction(F)) {
+    PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
+        FunctionAnalysisManager &FAM =
+            MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+        const DataLayout &DL = M.getDataLayout();
+
+        AnalysisStats ModuleStats;
+        InterproceduralContext ICtx;
+        bool ModuleModified = false;
+
+        for (Function &F : M) {
+            if (F.isDeclaration() || isMemoryGuardRuntimeFunction(F)) {
+                continue;
+            }
+
+            errs() << "[MemoryGuard] Analyzing function @" << F.getName() << "\n";
+
+            DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+            ICtx.CurrentDT = &DT;
+
+            AnalysisStats FuncStats;
+            bool FuncModified = runOnFunction(F, M, DL, DT, ICtx, FuncStats);
+            if (FuncModified) {
+                ModuleModified = true;
+            }
+
+            printFunctionSummary(F.getName(), FuncStats);
+            ModuleStats.add(FuncStats);
+        }
+
+        printModuleSummary(ModuleStats);
+
+        if (!ModuleModified) {
             return PreservedAnalyses::all();
         }
 
-        errs() << "MemoryGuard: analyzing function " << F.getName() << "\n";
+        PreservedAnalyses PA;
+        PA.preserve<DominatorTreeAnalysis>();
+        return PA;
+    }
 
-        const DataLayout &DL = F.getParent()->getDataLayout();
-        DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-        Module *M = F.getParent();
+    // Ensure the pass runs on all modules/functions, including unoptimized (-O0) code
+    static bool isRequired() { return true; }
 
-        InterproceduralContext ICtx;
-        ICtx.CurrentDT = &DT;
+private:
+    enum class RewriteKind { MALLOC, CALLOC, REALLOC, FREE };
 
-        enum class RewriteKind { MALLOC, CALLOC, REALLOC, FREE };
-        struct CallRewriteSite {
-            CallBase *CB;
-            RewriteKind Kind;
-        };
+    struct CallRewriteSite {
+        CallBase *CB;
+        RewriteKind Kind;
+    };
+
+    struct InstrumentationSite {
+        Instruction *Inst;
+        Value *Ptr;
+        uint64_t AccessSize;
+    };
+
+    bool runOnFunction(Function &F, Module &M, const DataLayout &DL,
+                       const DominatorTree &DT, InterproceduralContext &ICtx,
+                       AnalysisStats &Stats) {
         SmallVector<CallRewriteSite, 8> CallsToRewrite;
-
-        struct InstrumentationSite {
-            Instruction *Inst;
-            Value *Ptr;
-            uint64_t AccessSize;
-        };
         SmallVector<InstrumentationSite, 16> SitesToInstrument;
 
         for (BasicBlock &BB : F) {
@@ -1015,161 +1138,224 @@ public:
                     analyzeAllocation(F, CB);
                     if (isCompatibleMallocCall(CB, DL)) {
                         CallsToRewrite.push_back({CB, RewriteKind::MALLOC});
+                        Stats.AllocatorsRewritten++;
+                        errs() << "[MemoryGuard]   [ALLOC REWRITE] function=@" << F.getName()
+                               << " malloc -> mg_intercept_malloc\n";
                     } else if (isCompatibleCallocCall(CB, DL)) {
                         CallsToRewrite.push_back({CB, RewriteKind::CALLOC});
+                        Stats.AllocatorsRewritten++;
+                        errs() << "[MemoryGuard]   [ALLOC REWRITE] function=@" << F.getName()
+                               << " calloc -> mg_intercept_calloc\n";
                     } else if (isCompatibleReallocCall(CB, DL)) {
                         CallsToRewrite.push_back({CB, RewriteKind::REALLOC});
+                        Stats.AllocatorsRewritten++;
+                        errs() << "[MemoryGuard]   [ALLOC REWRITE] function=@" << F.getName()
+                               << " realloc -> mg_intercept_realloc\n";
                     } else if (isCompatibleFreeCall(CB)) {
                         CallsToRewrite.push_back({CB, RewriteKind::FREE});
+                        Stats.AllocatorsRewritten++;
+                        errs() << "[MemoryGuard]   [ALLOC REWRITE] function=@" << F.getName()
+                               << " free -> mg_intercept_free\n";
+                    } else if (isAllocatorCandidate(CB)) {
+                        Stats.IncompatibleAllocatorsSkipped++;
+                        errs() << "[MemoryGuard]   [ALLOC SKIP] function=@" << F.getName()
+                               << " (skipped: incompatible or unsupported allocator call)\n";
                     }
                 } else if (auto *LI = dyn_cast<LoadInst>(&I)) {
+                    Stats.TotalAccessesExamined++;
                     Value *Ptr = LI->getPointerOperand();
                     Type *AccessedType = LI->getType();
                     TypeSize StoreSize = DL.getTypeStoreSize(AccessedType);
-                    PointerOrigin Origin = classifyPointerOrigin(Ptr, &DT, ICtx);
 
                     if (LI->isAtomic()) {
-                        errs() << "  [ATOMIC READ] function=" << F.getName()
+                        Stats.AtomicOperationsSkipped++;
+                        errs() << "[MemoryGuard]   [ATOMIC READ] function=@" << F.getName()
                                << " type=";
                         AccessedType->print(errs());
                         errs() << " ptr=";
                         Ptr->printAsOperand(errs(), false);
-                        errs() << " size=";
-                        if (StoreSize.isScalable()) {
-                            errs() << "scalable (min " << StoreSize.getKnownMinValue() << " bytes)";
-                        } else {
-                            errs() << StoreSize.getFixedValue() << " bytes";
-                        }
                         errs() << " ordering=" << atomicOrderingToString(LI->getOrdering())
-                               << " origin=" << originToString(Origin)
-                               << " (skipped: atomic synchronization preservation)\n";
-                    } else {
-                        errs() << (LI->isVolatile() ? "  [READ] (volatile)" : "  [READ] ")
-                               << " function=" << F.getName()
+                               << " (skipped: atomic operation)\n";
+                        continue;
+                    }
+
+                    if (StoreSize.isScalable()) {
+                        Stats.ScalableVectorSkipped++;
+                        errs() << "[MemoryGuard]   [READ] function=@" << F.getName()
                                << " type=";
                         AccessedType->print(errs());
                         errs() << " ptr=";
                         Ptr->printAsOperand(errs(), false);
-                        errs() << " size=";
-                        if (StoreSize.isScalable()) {
-                            errs() << "scalable (min " << StoreSize.getKnownMinValue() << " bytes)";
-                        } else {
-                            errs() << StoreSize.getFixedValue() << " bytes";
-                        }
-                        errs() << " origin=" << originToString(Origin) << "\n";
+                        errs() << " (skipped: scalable vector memory access unsupported)\n";
+                        continue;
+                    }
 
-                        // Instrument only HEAP_CANDIDATE load accesses with fixed sizes and standard address space
-                        if (Origin == PointerOrigin::HEAP_CANDIDATE) {
-                            if (StoreSize.isScalable()) {
-                                errs() << "    (skipped: scalable vector memory access unsupported)\n";
-                            } else if (auto *PT = dyn_cast<PointerType>(Ptr->getType())) {
-                                if (PT->getAddressSpace() != 0) {
-                                    errs() << "    (skipped: non-default address space " << PT->getAddressSpace() << " unsupported)\n";
-                                } else {
-                                    uint64_t FixedSize = StoreSize.getFixedValue();
-                                    if (!isAlreadyInstrumented(LI, Ptr, FixedSize)) {
-                                        SitesToInstrument.push_back({LI, Ptr, FixedSize});
-                                    }
-                                }
+                    auto *PT = dyn_cast<PointerType>(Ptr->getType());
+                    if (PT && PT->getAddressSpace() != 0) {
+                        Stats.UnsupportedAddrSpaceSkipped++;
+                        errs() << "[MemoryGuard]   [READ] function=@" << F.getName()
+                               << " type=";
+                        AccessedType->print(errs());
+                        errs() << " ptr=";
+                        Ptr->printAsOperand(errs(), false);
+                        errs() << " (skipped: non-default address space " << PT->getAddressSpace() << " unsupported)\n";
+                        continue;
+                    }
+
+                    PointerOrigin Origin = classifyPointerOrigin(Ptr, &DT, ICtx);
+                    if (Origin == PointerOrigin::NON_HEAP) {
+                        Stats.NonHeapAccessesSkipped++;
+                        errs() << (LI->isVolatile() ? "[MemoryGuard]   [READ] (volatile)" : "[MemoryGuard]   [READ]")
+                               << " function=@" << F.getName()
+                               << " type=";
+                        AccessedType->print(errs());
+                        errs() << " ptr=";
+                        Ptr->printAsOperand(errs(), false);
+                        errs() << " size=" << StoreSize.getFixedValue() << " bytes"
+                               << " origin=NON_HEAP\n";
+                    } else if (Origin == PointerOrigin::UNKNOWN) {
+                        Stats.UnknownAccessesSkipped++;
+                        errs() << (LI->isVolatile() ? "[MemoryGuard]   [READ] (volatile)" : "[MemoryGuard]   [READ]")
+                               << " function=@" << F.getName()
+                               << " type=";
+                        AccessedType->print(errs());
+                        errs() << " ptr=";
+                        Ptr->printAsOperand(errs(), false);
+                        errs() << " size=" << StoreSize.getFixedValue() << " bytes"
+                               << " origin=UNKNOWN\n";
+                    } else if (Origin == PointerOrigin::HEAP_CANDIDATE) {
+                        Stats.HeapAccessesIdentified++;
+                        errs() << (LI->isVolatile() ? "[MemoryGuard]   [READ] (volatile)" : "[MemoryGuard]   [READ]")
+                               << " function=@" << F.getName()
+                               << " type=";
+                        AccessedType->print(errs());
+                        errs() << " ptr=";
+                        Ptr->printAsOperand(errs(), false);
+                        errs() << " size=" << StoreSize.getFixedValue() << " bytes"
+                               << " origin=HEAP_CANDIDATE\n";
+
+                        uint64_t FixedSize = StoreSize.getFixedValue();
+                        if (isAlreadyInstrumented(LI, Ptr, FixedSize)) {
+                            errs() << "    (already instrumented, skipping duplicate check)\n";
+                        } else {
+                            Stats.ChecksInserted++;
+                            if (LI->isVolatile()) {
+                                Stats.VolatileAccessesInstrumented++;
                             }
+                            SitesToInstrument.push_back({LI, Ptr, FixedSize});
                         }
                     }
                 } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+                    Stats.TotalAccessesExamined++;
                     Value *Ptr = SI->getPointerOperand();
                     Type *StoredType = SI->getValueOperand()->getType();
                     TypeSize StoreSize = DL.getTypeStoreSize(StoredType);
-                    PointerOrigin Origin = classifyPointerOrigin(Ptr, &DT, ICtx);
 
                     if (SI->isAtomic()) {
-                        errs() << "  [ATOMIC WRITE] function=" << F.getName()
+                        Stats.AtomicOperationsSkipped++;
+                        errs() << "[MemoryGuard]   [ATOMIC WRITE] function=@" << F.getName()
                                << " type=";
                         StoredType->print(errs());
                         errs() << " ptr=";
                         Ptr->printAsOperand(errs(), false);
-                        errs() << " size=";
-                        if (StoreSize.isScalable()) {
-                            errs() << "scalable (min " << StoreSize.getKnownMinValue() << " bytes)";
-                        } else {
-                            errs() << StoreSize.getFixedValue() << " bytes";
-                        }
                         errs() << " ordering=" << atomicOrderingToString(SI->getOrdering())
-                               << " origin=" << originToString(Origin)
-                               << " (skipped: atomic synchronization preservation)\n";
-                    } else {
-                        errs() << (SI->isVolatile() ? "  [WRITE] (volatile)" : "  [WRITE]")
-                               << " function=" << F.getName()
+                               << " (skipped: atomic operation)\n";
+                        continue;
+                    }
+
+                    if (StoreSize.isScalable()) {
+                        Stats.ScalableVectorSkipped++;
+                        errs() << "[MemoryGuard]   [WRITE] function=@" << F.getName()
                                << " type=";
                         StoredType->print(errs());
                         errs() << " ptr=";
                         Ptr->printAsOperand(errs(), false);
-                        errs() << " size=";
-                        if (StoreSize.isScalable()) {
-                            errs() << "scalable (min " << StoreSize.getKnownMinValue() << " bytes)";
-                        } else {
-                            errs() << StoreSize.getFixedValue() << " bytes";
-                        }
-                        errs() << " origin=" << originToString(Origin) << "\n";
+                        errs() << " (skipped: scalable vector memory access unsupported)\n";
+                        continue;
+                    }
 
-                        // Instrument only HEAP_CANDIDATE store accesses with fixed sizes and standard address space
-                        if (Origin == PointerOrigin::HEAP_CANDIDATE) {
-                            if (StoreSize.isScalable()) {
-                                errs() << "    (skipped: scalable vector memory access unsupported)\n";
-                            } else if (auto *PT = dyn_cast<PointerType>(Ptr->getType())) {
-                                if (PT->getAddressSpace() != 0) {
-                                    errs() << "    (skipped: non-default address space " << PT->getAddressSpace() << " unsupported)\n";
-                                } else {
-                                    uint64_t FixedSize = StoreSize.getFixedValue();
-                                    if (!isAlreadyInstrumented(SI, Ptr, FixedSize)) {
-                                        SitesToInstrument.push_back({SI, Ptr, FixedSize});
-                                    }
-                                }
+                    auto *PT = dyn_cast<PointerType>(Ptr->getType());
+                    if (PT && PT->getAddressSpace() != 0) {
+                        Stats.UnsupportedAddrSpaceSkipped++;
+                        errs() << "[MemoryGuard]   [WRITE] function=@" << F.getName()
+                               << " type=";
+                        StoredType->print(errs());
+                        errs() << " ptr=";
+                        Ptr->printAsOperand(errs(), false);
+                        errs() << " (skipped: non-default address space " << PT->getAddressSpace() << " unsupported)\n";
+                        continue;
+                    }
+
+                    PointerOrigin Origin = classifyPointerOrigin(Ptr, &DT, ICtx);
+                    if (Origin == PointerOrigin::NON_HEAP) {
+                        Stats.NonHeapAccessesSkipped++;
+                        errs() << (SI->isVolatile() ? "[MemoryGuard]   [WRITE] (volatile)" : "[MemoryGuard]   [WRITE]")
+                               << " function=@" << F.getName()
+                               << " type=";
+                        StoredType->print(errs());
+                        errs() << " ptr=";
+                        Ptr->printAsOperand(errs(), false);
+                        errs() << " size=" << StoreSize.getFixedValue() << " bytes"
+                               << " origin=NON_HEAP\n";
+                    } else if (Origin == PointerOrigin::UNKNOWN) {
+                        Stats.UnknownAccessesSkipped++;
+                        errs() << (SI->isVolatile() ? "[MemoryGuard]   [WRITE] (volatile)" : "[MemoryGuard]   [WRITE]")
+                               << " function=@" << F.getName()
+                               << " type=";
+                        StoredType->print(errs());
+                        errs() << " ptr=";
+                        Ptr->printAsOperand(errs(), false);
+                        errs() << " size=" << StoreSize.getFixedValue() << " bytes"
+                               << " origin=UNKNOWN\n";
+                    } else if (Origin == PointerOrigin::HEAP_CANDIDATE) {
+                        Stats.HeapAccessesIdentified++;
+                        errs() << (SI->isVolatile() ? "[MemoryGuard]   [WRITE] (volatile)" : "[MemoryGuard]   [WRITE]")
+                               << " function=@" << F.getName()
+                               << " type=";
+                        StoredType->print(errs());
+                        errs() << " ptr=";
+                        Ptr->printAsOperand(errs(), false);
+                        errs() << " size=" << StoreSize.getFixedValue() << " bytes"
+                               << " origin=HEAP_CANDIDATE\n";
+
+                        uint64_t FixedSize = StoreSize.getFixedValue();
+                        if (isAlreadyInstrumented(SI, Ptr, FixedSize)) {
+                            errs() << "    (already instrumented, skipping duplicate check)\n";
+                        } else {
+                            Stats.ChecksInserted++;
+                            if (SI->isVolatile()) {
+                                Stats.VolatileAccessesInstrumented++;
                             }
+                            SitesToInstrument.push_back({SI, Ptr, FixedSize});
                         }
                     }
                 } else if (auto *RMW = dyn_cast<AtomicRMWInst>(&I)) {
+                    Stats.AtomicOperationsSkipped++;
                     Value *Ptr = RMW->getPointerOperand();
                     Type *ValType = RMW->getValOperand()->getType();
-                    TypeSize ValSize = DL.getTypeStoreSize(ValType);
-                    PointerOrigin Origin = classifyPointerOrigin(Ptr, &DT, ICtx);
-
-                    errs() << "  [ATOMIC RMW] function=" << F.getName()
+                    errs() << "[MemoryGuard]   [ATOMIC RMW] function=@" << F.getName()
                            << " op=" << atomicRMWOpToString(RMW->getOperation())
                            << " type=";
                     ValType->print(errs());
                     errs() << " ptr=";
                     Ptr->printAsOperand(errs(), false);
-                    errs() << " size=";
-                    if (ValSize.isScalable()) {
-                        errs() << "scalable (min " << ValSize.getKnownMinValue() << " bytes)";
-                    } else {
-                        errs() << ValSize.getFixedValue() << " bytes";
-                    }
                     errs() << " ordering=" << atomicOrderingToString(RMW->getOrdering())
-                           << " origin=" << originToString(Origin)
-                           << " (skipped: atomic synchronization preservation)\n";
+                           << " (skipped: atomic operation)\n";
                 } else if (auto *CXI = dyn_cast<AtomicCmpXchgInst>(&I)) {
+                    Stats.AtomicOperationsSkipped++;
                     Value *Ptr = CXI->getPointerOperand();
                     Type *ValType = CXI->getCompareOperand()->getType();
-                    TypeSize ValSize = DL.getTypeStoreSize(ValType);
-                    PointerOrigin Origin = classifyPointerOrigin(Ptr, &DT, ICtx);
-
-                    errs() << "  [ATOMIC CMPXCHG] function=" << F.getName()
+                    errs() << "[MemoryGuard]   [ATOMIC CMPXCHG] function=@" << F.getName()
                            << " type=";
                     ValType->print(errs());
                     errs() << " ptr=";
                     Ptr->printAsOperand(errs(), false);
-                    errs() << " size=";
-                    if (ValSize.isScalable()) {
-                        errs() << "scalable (min " << ValSize.getKnownMinValue() << " bytes)";
-                    } else {
-                        errs() << ValSize.getFixedValue() << " bytes";
-                    }
                     errs() << " success_ordering=" << atomicOrderingToString(CXI->getSuccessOrdering())
                            << " failure_ordering=" << atomicOrderingToString(CXI->getFailureOrdering())
-                           << " origin=" << originToString(Origin)
-                           << " (skipped: atomic synchronization preservation)\n";
+                           << " (skipped: atomic operation)\n";
                 } else if (auto *FI = dyn_cast<FenceInst>(&I)) {
-                    errs() << "  [ATOMIC FENCE] function=" << F.getName()
+                    Stats.AtomicOperationsSkipped++;
+                    errs() << "[MemoryGuard]   [ATOMIC FENCE] function=@" << F.getName()
                            << " ordering=" << atomicOrderingToString(FI->getOrdering())
                            << " (skipped: no pointer operand)\n";
                 }
@@ -1182,7 +1368,7 @@ public:
         for (const auto &Site : CallsToRewrite) {
             switch (Site.Kind) {
             case RewriteKind::MALLOC: {
-                FunctionCallee InterceptMalloc = getOrInsertInterceptMalloc(*M, DL);
+                FunctionCallee InterceptMalloc = getOrInsertInterceptMalloc(M, DL);
                 Site.CB->setCalledFunction(InterceptMalloc);
                 Site.CB->removeFnAttr(Attribute::AllocSize);
                 Site.CB->removeFnAttr(Attribute::Builtin);
@@ -1190,7 +1376,7 @@ public:
                 break;
             }
             case RewriteKind::CALLOC: {
-                FunctionCallee InterceptCalloc = getOrInsertInterceptCalloc(*M, DL);
+                FunctionCallee InterceptCalloc = getOrInsertInterceptCalloc(M, DL);
                 Site.CB->setCalledFunction(InterceptCalloc);
                 Site.CB->removeFnAttr(Attribute::AllocSize);
                 Site.CB->removeFnAttr(Attribute::Builtin);
@@ -1198,7 +1384,7 @@ public:
                 break;
             }
             case RewriteKind::REALLOC: {
-                FunctionCallee InterceptRealloc = getOrInsertInterceptRealloc(*M, DL);
+                FunctionCallee InterceptRealloc = getOrInsertInterceptRealloc(M, DL);
                 Site.CB->setCalledFunction(InterceptRealloc);
                 Site.CB->removeFnAttr(Attribute::AllocSize);
                 Site.CB->removeFnAttr(Attribute::Builtin);
@@ -1206,7 +1392,7 @@ public:
                 break;
             }
             case RewriteKind::FREE: {
-                FunctionCallee InterceptFree = getOrInsertInterceptFree(*M);
+                FunctionCallee InterceptFree = getOrInsertInterceptFree(M);
                 Site.CB->setCalledFunction(InterceptFree);
                 Site.CB->removeFnAttr(Attribute::Builtin);
                 Modified = true;
@@ -1217,7 +1403,7 @@ public:
 
         // Perform heap check instrumentation
         if (!SitesToInstrument.empty()) {
-            FunctionCallee CheckFn = getOrInsertCheckFunction(*M, DL);
+            FunctionCallee CheckFn = getOrInsertCheckFunction(M, DL);
             LLVMContext &Ctx = F.getContext();
             Type *SizeTy = DL.getIntPtrType(Ctx);
 
@@ -1231,17 +1417,8 @@ public:
             Modified = true;
         }
 
-        if (!Modified) {
-            return PreservedAnalyses::all();
-        }
-
-        PreservedAnalyses PA;
-        PA.preserve<DominatorTreeAnalysis>();
-        return PA;
+        return Modified;
     }
-
-    // Ensure the pass runs on all functions, including unoptimized (-O0) code
-    static bool isRequired() { return true; }
 
 private:
     void analyzeAllocation(const Function &F, const CallBase *CB) {
@@ -1268,7 +1445,7 @@ private:
             }
             Value *SizeArg = CB->getArgOperand(0);
 
-            errs() << "  [ALLOC] function=" << F.getName()
+            errs() << "[MemoryGuard]   [ALLOC] function=@" << F.getName()
                    << " api=" << CalleeName << " ptr=";
             CB->printAsOperand(errs(), false);
             errs() << " size=";
@@ -1286,7 +1463,7 @@ private:
             Value *CountArg = CB->getArgOperand(0);
             Value *SizeArg = CB->getArgOperand(1);
 
-            errs() << "  [ALLOC] function=" << F.getName()
+            errs() << "[MemoryGuard]   [ALLOC] function=@" << F.getName()
                    << " api=" << CalleeName << " ptr=";
             CB->printAsOperand(errs(), false);
             errs() << " size=";
@@ -1319,7 +1496,7 @@ private:
             Value *OldPtr = CB->getArgOperand(0);
             Value *SizeArg = CB->getArgOperand(1);
 
-            errs() << "  [ALLOC] function=" << F.getName()
+            errs() << "[MemoryGuard]   [ALLOC] function=@" << F.getName()
                    << " api=" << CalleeName << " ptr=";
             CB->printAsOperand(errs(), false);
             errs() << " old_ptr=";
@@ -1350,10 +1527,10 @@ extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
         LLVM_VERSION_STRING,
         [](PassBuilder &PB) {
             PB.registerPipelineParsingCallback(
-                [](StringRef Name, FunctionPassManager &FPM,
+                [](StringRef Name, ModulePassManager &MPM,
                    ArrayRef<PassBuilder::PipelineElement>) {
                     if (Name == "memoryguard") {
-                        FPM.addPass(MemoryGuardPass());
+                        MPM.addPass(MemoryGuardPass());
                         return true;
                     }
                     return false;

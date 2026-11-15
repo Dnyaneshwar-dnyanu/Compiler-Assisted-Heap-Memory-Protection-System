@@ -105,6 +105,13 @@ if(Python3_FOUND AND OPT_TOOL)
                 ${OPT_TOOL} $<TARGET_FILE:MemoryGuardPass>
                 ${CMAKE_CURRENT_SOURCE_DIR}/examples/test_negative_cases.ll
     )
+    add_test(
+        NAME test_diagnostics_summary
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_diagnostics_summary.py
+                ${OPT_TOOL} $<TARGET_FILE:MemoryGuardPass>
+                ${CMAKE_CURRENT_SOURCE_DIR}/examples/test_diagnostics.ll
+    )
 endif()
+
 
 
