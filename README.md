@@ -82,6 +82,7 @@ MemoryGuard operates in two primary phases:
 | **Step 17** | Compiler Diagnostics | Completed | Structured per-function and module-level analysis metrics and diagnostics. |
 | **Step 18** | Audited Performance Benchmarks | Completed | Monotonic nanosecond timing, compiler-optimization barriers, batching, and empirical slowdown analysis. |
 | **Step 19** | Node.js Backend Foundation | Completed | Modular Express backend with health, system diagnostics, validated compile placeholder, and test suite. |
+| **Step 20** | LLVM Compiler Integration | Completed | Integrated Clang 18, Opt, and MemoryGuard pass plugin with Express backend for automated compilation, instrumentation, and linking. |
 
 ---
 
@@ -90,20 +91,31 @@ MemoryGuard operates in two primary phases:
 ```
 .
 ├── CMakeLists.txt                 # Top-level build configuration (C11, C++17, CTest)
-├── backend/                       # Node.js Express backend (Step 19)
+├── backend/                       # Node.js Express backend (Steps 19 & 20)
 │   ├── package.json               # Backend dependencies, scripts, and engine specifications
-│   ├── .env.example               # Template environment configuration
-│   ├── .gitignore                 # Backend-specific ignore rules
+│   ├── .env.example               # Template environment configuration with LLVM toolchain
+│   ├── .gitignore                 # Backend-specific ignore rules (workspaces, logs, uploads)
 │   ├── src/
 │   │   ├── config/                # Centralized configuration loader (dotenv)
 │   │   ├── controllers/           # HTTP request handlers (health, system, compile)
 │   │   ├── middleware/            # Error handling, 404 handler, request validation
 │   │   ├── routes/                # Express router definitions
-│   │   ├── services/              # Pure business logic and compile placeholder service
+│   │   ├── services/              # Pure business logic and compiler coordinator
+│   │   │   └── compiler/          # LLVM 18 toolchain integration services (Step 20)
+│   │   │       ├── compilerConfig.js    # Toolchain path resolution & diagnostics sanitizer
+│   │   │       ├── compilerRunner.js    # Safe child_process.spawn with timeout & output caps
+│   │   │       ├── workspaceManager.js  # UUID workspace isolation & path-traversal safety
+│   │   │       └── compilerService.js   # 3-stage pipeline (Clang IR -> Opt pass -> Linker)
 │   │   ├── utils/                 # Structured response formatters and logger
 │   │   ├── app.js                 # Express app initialization (Helmet, CORS, Morgan)
 │   │   └── server.js              # Server entry point with graceful shutdown
 │   └── tests/                     # Automated test suite (node:test + supertest)
+│       ├── compile.test.js        # POST /api/compile C & C++ integration tests
+│       ├── compilerPipeline.test.js # Toolchain, workspace safety & runner unit tests
+│       ├── errorHandler.test.js   # Centralized error handler tests
+│       ├── health.test.js         # GET /api/health tests
+│       ├── notFound.test.js       # 404 JSON fallback tests
+│       └── system.test.js         # GET /api/system/info diagnostic tests
 ├── compiler/
 │   ├── CMakeLists.txt             # LLVM plugin build configuration
 │   └── src/
@@ -278,20 +290,41 @@ Aborted (core dumped)
 
 ---
 
-## Node.js Backend Service (Step 19)
+## Node.js Backend & LLVM Compiler Integration (Steps 19 & 20)
 
 ### 1. Purpose & Architecture
-The MemoryGuard backend provides a modular REST API foundation built with Node.js and Express. It serves as the orchestration layer that will connect frontend clients, the LLVM compiler pipeline, and execution sandboxes in subsequent development phases.
+The MemoryGuard backend provides a modular REST API built with Node.js and Express. In Step 20, the backend connects directly to the MemoryGuard LLVM compiler pipeline to compile, instrument, and link user-submitted C and C++ programs into memory-safe executables.
 
-### 2. Technologies Used
-- **Runtime**: Node.js (>= 18.0.0, tested on v22.18.0)
-- **Framework**: Express.js 4.x
-- **Module System**: ECMAScript Modules (ESM)
-- **Security**: Helmet HTTP headers, configurable CORS
-- **Logging**: Morgan HTTP access logger
-- **Configuration**: Dotenv (`.env.example`)
-- **Testing**: Node.js native test runner (`node:test`, `node:assert/strict`) with Supertest
-- **Development Tooling**: Nodemon
+The compiler integration follows a strict 3-stage pipeline executed in isolated workspaces:
+
+```
+[POST /api/compile]
+        │
+        ▼ (Stage 1: Frontend Compilation)
+  clang-18 / clang++-18 -O0 -Xclang -disable-O0-optnone -emit-llvm -S source.c -o source.ll
+        │
+        ▼ (Stage 2: LLVM Pass Instrumentation)
+  opt-18 -load-pass-plugin=MemoryGuardPass.so -passes=memoryguard -S source.ll -o source_inst.ll
+        │
+        ▼ (Stage 3: Linking with Runtime)
+  clang-18 / clang++-18 source_inst.ll libmemoryguard.a -pthread -lm -o program.bin
+        │
+        ▼
+[Structured Response with Diagnostics & Artifact Availability]
+```
+
+### 2. Technologies Used & Toolchain Requirements
+- **Runtime**: Node.js (>= 18.0.0, validated on v22.18.0)
+- **Framework**: Express.js 4.x with ECMAScript Modules (ESM)
+- **Compiler Toolchain**: Clang 18.1.3 and LLVM 18.1.3 (`clang-18`, `clang++-18`, `opt-18`)
+- **Plugin Artifacts**: `build/compiler/MemoryGuardPass.so` and `build/libmemoryguard.a`
+- **Security**:
+  - `child_process.spawn()` with strict argument arrays (zero shell interpolation)
+  - Configurable timeouts (`MG_COMPILER_TIMEOUT_MS`) with automatic SIGTERM/SIGKILL escalation
+  - Output truncation bounds (`MG_MAX_OUTPUT_BYTES`) to prevent memory exhaustion
+  - UUID workspace isolation (`MG_WORKSPACE_ROOT`) with directory traversal protection
+  - Host path sanitization (strips server paths from compiler diagnostics)
+  - Helmet HTTP security headers and CORS controls
 
 ### 3. Setup & Installation
 ```bash
@@ -315,6 +348,17 @@ Available environment variables:
 | `NODE_ENV` | `development` | Environment tier (`development`, `production`, `test`) |
 | `CORS_ORIGIN` | `*` | Allowed CORS origins (wildcard `*` or comma-separated URLs) |
 | `MAX_REQUEST_SIZE` | `1mb` | Maximum JSON request body size limit |
+| `MG_CLANG` | `clang-18` | Clang C compiler executable |
+| `MG_CLANGXX` | `clang++-18` | Clang C++ compiler executable |
+| `MG_OPT` | `opt-18` | LLVM opt optimizer tool |
+| `MG_PASS_PLUGIN` | `../build/compiler/MemoryGuardPass.so` | Path to compiled MemoryGuard LLVM pass plugin |
+| `MG_RUNTIME_LIBRARY` | `../build/libmemoryguard.a` | Path to compiled MemoryGuard static runtime library |
+| `MG_RUNTIME_INCLUDE` | `../runtime/include` | Path to MemoryGuard runtime include headers |
+| `MG_WORKSPACE_ROOT` | `.workspaces` | Directory where compilation workspaces are isolated |
+| `MG_COMPILER_TIMEOUT_MS` | `15000` | Process timeout for compiler stages (in milliseconds) |
+| `MG_MAX_SOURCE_BYTES` | `524288` | Maximum allowed source code payload (512 KB) |
+| `MG_MAX_OUTPUT_BYTES` | `262144` | Maximum compiler output captured before truncation (256 KB) |
+| `MG_USE_WSL` | `auto` | Set `true` on Windows to run Linux LLVM 18 tools via WSL |
 
 > [!NOTE]
 > Never commit a `.env` file containing secrets or environment-specific values. `.env` is intentionally ignored by Git.
@@ -329,9 +373,9 @@ npm start
 ```
 
 ### 6. Executing Automated Tests
-The backend includes automated integration and unit tests covering health monitoring, system diagnostics, request validation, error formatting, and route fallback:
+The backend includes 31 automated integration and unit tests covering health monitoring, system diagnostics, request validation, error formatting, route fallback, and real C/C++ LLVM compilation pipelines:
 ```bash
-# Run the test suite
+# Run the complete test suite
 npm test
 ```
 
@@ -349,8 +393,8 @@ Returns service availability, application metadata, timestamp, and process uptim
     "status": "healthy",
     "application": "MemoryGuard Backend API",
     "version": "1.0.0",
-    "timestamp": "2026-11-15T16:56:24.905Z",
-    "uptimeSeconds": 12
+    "timestamp": "2026-11-16T17:50:00.000Z",
+    "uptimeSeconds": 42
   }
 }
 ```
@@ -368,52 +412,95 @@ Returns sanitized runtime diagnostics and platform metrics. Does not expose file
     "platform": "win32",
     "arch": "x64",
     "environment": "development",
-    "uptimeSeconds": 12,
+    "uptimeSeconds": 42,
     "memoryUsageMB": {
-      "rss": 58,
-      "heapTotal": 19,
-      "heapUsed": 10
+      "rss": 62,
+      "heapTotal": 24,
+      "heapUsed": 15
     }
   }
 }
 ```
 
 #### `POST /api/compile`
-Initial endpoint structure that validates incoming source code payloads and returns a structured placeholder response.
-- **Request Body**:
+Compiles, instruments, and links C or C++ source code using the LLVM 18 MemoryGuard toolchain.
+- **Request Body (C Example)**:
 ```json
 {
-  "sourceCode": "#include <stdlib.h>\nint main() { char *p = malloc(16); free(p); return 0; }",
+  "sourceCode": "#include <stdlib.h>\nint main() {\n    int *p = (int *)malloc(32);\n    p[0] = 42;\n    free(p);\n    return 0;\n}",
   "language": "c"
 }
 ```
-- **Status Code**: `200 OK` (when valid) or `400 Bad Request` (when missing/empty/non-string)
-- **Response Example**:
+- **Success Response (`200 OK`)**:
 ```json
 {
   "success": true,
-  "message": "Source code received successfully. Compiler execution is not implemented in Step 19.",
+  "message": "Compilation and MemoryGuard instrumentation succeeded.",
   "data": {
-    "status": "pending_compiler_integration",
+    "jobId": "7f3b891a-4d2c-4e89-9a1b-123456789abc",
+    "status": "completed",
     "language": "c",
-    "sourceMetadata": {
-      "lineCount": 2,
-      "byteLength": 67
+    "stages": [
+      { "name": "FRONTEND_COMPILATION", "status": "completed", "durationMs": 142 },
+      { "name": "INSTRUMENTATION", "status": "completed", "durationMs": 85 },
+      { "name": "LINKING", "status": "completed", "durationMs": 118 }
+    ],
+    "diagnostics": {
+      "summary": {
+        "functionsAnalyzed": ["main"],
+        "totalAccessesExamined": 7,
+        "heapAccessesIdentified": 2,
+        "checksInserted": 2,
+        "volatileAccessesInstrumented": 0,
+        "nonHeapSkipped": 5,
+        "unknownOriginSkipped": 0,
+        "atomicOperationsSkipped": 0,
+        "unsupportedAddressSpaceSkipped": 0,
+        "scalableVectorSkipped": 0,
+        "allocatorCallsRewritten": 2,
+        "incompatibleAllocatorCallsSkipped": 0
+      },
+      "raw": "[MemoryGuard][Summary] Module Analysis Summary:\n  Total load and store instructions examined: 7\n  Heap-origin accesses identified: 2\n  Runtime checks inserted: 2\n  Allocator calls detected and successfully rewritten: 2"
     },
-    "message": "Source code received and validated. MemoryGuard compiler pass integration is pending (Step 19 backend foundation only). No code was executed."
+    "artifacts": {
+      "executableAvailable": true,
+      "bitcodeAvailable": true,
+      "instrumentedBitcodeAvailable": true
+    },
+    "metadata": {
+      "sourceBytes": 128,
+      "totalDurationMs": 352,
+      "executed": false
+    }
+  }
+}
+```
+
+- **Compilation Syntax Error (`422 Unprocessable Entity`)**:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "COMPILATION_ERROR",
+    "message": "Frontend compilation failed with errors.",
+    "stage": "FRONTEND_COMPILATION",
+    "jobId": "9a2c3d4e-5f6a-7b8c-9d0e-123456789def",
+    "diagnostics": "<workspace>/source.c:3:16: error: expected ';' after expression",
+    "stages": [
+      { "name": "FRONTEND_COMPILATION", "status": "failed", "durationMs": 82 }
+    ]
   }
 }
 ```
 
 > [!IMPORTANT]
-> **Compiler Execution Notice**: In Step 19, `POST /api/compile` performs request validation and returns metadata only. Invoking the LLVM compiler, running the MemoryGuard pass, and executing code in an isolated sandbox will be implemented in subsequent development steps. Submitted code is **not** executed in this step.
+> **Program Execution Notice**: In Step 20, `POST /api/compile` performs full compile-time instrumentation and linking, generating a valid executable artifact in the workspace. However, the generated binary is **not executed** in this step. Program execution in an isolated execution sandbox will be implemented in Step 21+.
 
 ---
 
 ### Current Limitations & Future Roadmap
 
-- **Compiler & Sandbox Execution**: Code submission via `POST /api/compile` is validated and handled as a placeholder; actual compilation and sandboxed execution will be integrated in subsequent steps.
-- **Authentication**: Endpoints currently operate without user authentication or rate limiting.
-- **Pointer-Origin Analysis**: Interprocedural pointer tracking is planned for future compiler pass iterations.
-- **Frontend Integration**: Web UI components will be connected to these backend endpoints in Step 20+.
+- **Sandbox Execution**: Generated executables are stored within unique workspaces ready for execution; safe process sandboxing (e.g. Docker, seccomp, or resource cgroups) will be integrated in subsequent phases.
+- **Authentication**: Endpoints currently operate without user authentication or persistent database queues.
+- **Frontend Integration**: Web UI components will be connected to these backend endpoints in Step 22+.
 

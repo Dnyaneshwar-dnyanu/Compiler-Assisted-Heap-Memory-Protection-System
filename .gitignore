@@ -14,12 +14,24 @@ cmake-build-*/
 *.out
 *.exe
 
+# Temporary LLVM bitcode files (preserve tracked test inputs in examples/)
+*.bc
+*.tmp.ll
+!examples/*.ll
+
 # Executables and temporary test binaries
 allocation_test
 
 # Node dependencies
 node_modules/
 backend/node_modules/
+
+# Backend workspaces, uploads, and runtime directories
+backend/.workspaces/
+.workspaces/
+backend/uploads/
+uploads/
+backend/logs/
 
 # Environment files and secrets
 .env

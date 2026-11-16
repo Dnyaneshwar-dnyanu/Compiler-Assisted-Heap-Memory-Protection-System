@@ -1,6 +1,10 @@
 # Node dependency directory
 node_modules/
 
+# Compilation workspaces and uploads
+.workspaces/
+uploads/
+
 # Environment files
 .env
 .env.local
