@@ -83,6 +83,7 @@ MemoryGuard operates in two primary phases:
 | **Step 18** | Audited Performance Benchmarks | Completed | Monotonic nanosecond timing, compiler-optimization barriers, batching, and empirical slowdown analysis. |
 | **Step 19** | Node.js Backend Foundation | Completed | Modular Express backend with health, system diagnostics, validated compile placeholder, and test suite. |
 | **Step 20** | LLVM Compiler Integration | Completed | Integrated Clang 18, Opt, and MemoryGuard pass plugin with Express backend for automated compilation, instrumentation, and linking. |
+| **Step 21** | Secure Docker Runtime Execution | Completed | Isolated container runtime execution service (`POST /api/execute`) enforcing strict Docker security hardening, read-only binary mounts, resource quotas, and diagnostic parsing. |
 
 ---
 
@@ -91,29 +92,41 @@ MemoryGuard operates in two primary phases:
 ```
 .
 ├── CMakeLists.txt                 # Top-level build configuration (C11, C++17, CTest)
-├── backend/                       # Node.js Express backend (Steps 19 & 20)
+├── docker/
+│   └── Dockerfile.runner          # Minimal root Dockerfile for debian:bookworm-slim runner
+├── backend/                       # Node.js Express backend (Steps 19, 20 & 21)
 │   ├── package.json               # Backend dependencies, scripts, and engine specifications
-│   ├── .env.example               # Template environment configuration with LLVM toolchain
+│   ├── .env.example               # Template environment configuration (LLVM toolchain & Docker settings)
 │   ├── .gitignore                 # Backend-specific ignore rules (workspaces, logs, uploads)
+│   ├── docker/
+│   │   └── Dockerfile.runner      # Minimal runner container definition (non-root mguser: 10001:10001)
 │   ├── src/
 │   │   ├── config/                # Centralized configuration loader (dotenv)
-│   │   ├── controllers/           # HTTP request handlers (health, system, compile)
+│   │   ├── controllers/           # HTTP request handlers (health, system, compile, execute)
 │   │   ├── middleware/            # Error handling, 404 handler, request validation
-│   │   ├── routes/                # Express router definitions
-│   │   ├── services/              # Pure business logic and compiler coordinator
-│   │   │   └── compiler/          # LLVM 18 toolchain integration services (Step 20)
-│   │   │       ├── compilerConfig.js    # Toolchain path resolution & diagnostics sanitizer
-│   │   │       ├── compilerRunner.js    # Safe child_process.spawn with timeout & output caps
-│   │   │       ├── workspaceManager.js  # UUID workspace isolation & path-traversal safety
-│   │   │       └── compilerService.js   # 3-stage pipeline (Clang IR -> Opt pass -> Linker)
+│   │   ├── routes/                # Express router definitions (compile, execute, health, system)
+│   │   ├── services/              # Pure business logic and modular orchestrators
+│   │   │   ├── compiler/          # LLVM 18 toolchain integration services (Step 20)
+│   │   │   │   ├── compilerConfig.js    # Toolchain path resolution & diagnostics sanitizer
+│   │   │   │   ├── compilerRunner.js    # Safe child_process.spawn with timeout & output caps
+│   │   │   │   ├── workspaceManager.js  # UUID workspace isolation & path-traversal safety
+│   │   │   │   └── compilerService.js   # 3-stage pipeline (Clang IR -> Opt pass -> Linker)
+│   │   │   └── execution/         # Secure Docker execution services (Step 21)
+│   │   │       ├── executionConfig.js   # Docker flags, resource limits & availability check
+│   │   │       ├── memoryGuardParser.js # Violation regex extractor & diagnostic categorizer
+│   │   │       ├── dockerRunner.js      # Isolated container spawn with resource caps & cleanup
+│   │   │       └── executionService.js  # Workspace validator, binary existence & execution coordinator
 │   │   ├── utils/                 # Structured response formatters and logger
 │   │   ├── app.js                 # Express app initialization (Helmet, CORS, Morgan)
 │   │   └── server.js              # Server entry point with graceful shutdown
-│   └── tests/                     # Automated test suite (node:test + supertest)
+│   └── tests/                     # Automated test suite (57 tests: node:test + supertest)
 │       ├── compile.test.js        # POST /api/compile C & C++ integration tests
 │       ├── compilerPipeline.test.js # Toolchain, workspace safety & runner unit tests
+│       ├── dockerRunner.test.js   # Docker argument hardening, resource caps & mock tests
 │       ├── errorHandler.test.js   # Centralized error handler tests
+│       ├── executionApi.test.js   # POST /api/execute integration tests & edge cases
 │       ├── health.test.js         # GET /api/health tests
+│       ├── memoryGuardParser.test.js # Violation parsing & status classification tests
 │       ├── notFound.test.js       # 404 JSON fallback tests
 │       └── system.test.js         # GET /api/system/info diagnostic tests
 ├── compiler/
@@ -493,14 +506,163 @@ Compiles, instruments, and links C or C++ source code using the LLVM 18 MemoryGu
 }
 ```
 
-> [!IMPORTANT]
-> **Program Execution Notice**: In Step 20, `POST /api/compile` performs full compile-time instrumentation and linking, generating a valid executable artifact in the workspace. However, the generated binary is **not executed** in this step. Program execution in an isolated execution sandbox will be implemented in Step 21+.
+---
+
+### Step 21: Secure Docker-Based Runtime Execution
+
+MemoryGuard enforces a strict zero-trust security architecture for running compiled user binaries. **Compiled binaries are NEVER executed directly on the host machine via Node.js `child_process`.** All executions are isolated inside ephemeral, single-use Docker containers with locked-down security profiles.
+
+#### Security Hardening Guarantees
+
+Every execution spawned through `docker run` applies the following container security flags:
+
+| Security Flag | Enforcement Purpose |
+| :--- | :--- |
+| `--network none` | Completely disables container networking (no ingress, no egress, no LAN/WAN access). |
+| `--read-only` | Root filesystem is mounted read-only; container cannot modify system files or binaries. |
+| `--user 10001:10001` | Drops all root privileges; runs strictly as unprivileged user `mguser`. |
+| `--cap-drop ALL` | Drops all Linux capabilities (no raw sockets, no ptrace, no mount, no chown). |
+| `--security-opt no-new-privileges` | Prevents privilege escalation through `setuid` or `setgid` binaries. |
+| `--memory 64m` | Strict memory ceiling prevents container-level memory exhaustion attacks. |
+| `--cpus 0.5` | Restricts CPU quota to half a core to prevent CPU exhaustion and infinite loop denial-of-service. |
+| `--pids-limit 32` | Prevents fork bombs and unbounded process creation. |
+| `--tmpfs /tmp:rw,noexec,nosuid,size=16m` | Temporary in-memory scratch space with `noexec` and `nosuid` enforcement. |
+| `-v <workspace>/program.bin:/app/program.bin:ro` | Only the specific compiled binary is mounted, strictly read-only. Host workspaces, source code, and secrets are inaccessible. |
+| `--rm` | Guarantees automatic container destruction upon process exit or termination. |
+| `--init` | Uses lightweight init process to reap zombie processes and forward termination signals cleanly. |
+| Execution Timeout (default: 5000ms) | Kills stuck processes via `SIGTERM` followed by Docker-level `docker kill` if uncooperative. |
+| Max Output Cap (default: 65,536 bytes) | Protects memory and response sizes by truncating oversized stdout/stderr streams. |
+
+> [!CAUTION]
+> **Strict Isolation Rule**: The Node.js backend does **NOT** provide any host-side fallback execution mechanism. If Docker is not installed or the Docker daemon is unreachable, `POST /api/execute` fails gracefully with HTTP status `503 Service Unavailable` (`DOCKER_UNAVAILABLE`).
+
+#### Building the Execution Runner Image
+
+Build the lightweight runner image prior to executing binaries:
+
+```bash
+# From the project root
+docker build -f docker/Dockerfile.runner -t memoryguard-runner:latest .
+
+# Or from within the backend directory
+docker build -f backend/docker/Dockerfile.runner -t memoryguard-runner:latest .
+```
+
+The runner image uses `debian:bookworm-slim`, installs only `libstdc++6` and `ca-certificates` for dynamic C++ runtime support, creates the non-root user `mguser` (`10001:10001`), and sets `/app/program.bin` as its immutable `ENTRYPOINT`.
+
+#### `POST /api/execute`
+Executes a previously compiled binary within the secure Docker sandbox and returns structured execution metrics and MemoryGuard runtime violation diagnostics.
+
+- **Request Body**:
+```json
+{
+  "jobId": "7f3b891a-4d2c-4e89-9a1b-123456789abc"
+}
+```
+
+- **Clean Execution Response (`200 OK` - `no_violations_detected`)**:
+```json
+{
+  "success": true,
+  "message": "Program execution completed inside secure Docker sandbox.",
+  "data": {
+    "jobId": "7f3b891a-4d2c-4e89-9a1b-123456789abc",
+    "status": "no_violations_detected",
+    "execution": {
+      "exitCode": 0,
+      "signal": null,
+      "timedOut": false,
+      "durationMs": 48,
+      "stdout": "Computation finished successfully.\n",
+      "stderr": "",
+      "outputTruncated": false
+    },
+    "violation": null
+  }
+}
+```
+
+- **MemoryGuard Violation Detected (`200 OK` - `violation_detected`)**:
+When an instrumented program triggers a spatial out-of-bounds or use-after-free violation, MemoryGuard logs the offending address and size to `stderr` and aborts (`SIGABRT`). The backend captures and categorizes this without marking the API call as a 500 error:
+```json
+{
+  "success": true,
+  "message": "Program execution completed inside secure Docker sandbox.",
+  "data": {
+    "jobId": "7f3b891a-4d2c-4e89-9a1b-123456789abc",
+    "status": "violation_detected",
+    "execution": {
+      "exitCode": 134,
+      "signal": "SIGABRT",
+      "timedOut": false,
+      "durationMs": 35,
+      "stdout": "",
+      "stderr": "MemoryGuard: VIOLATION DETECTED! Invalid access to ptr=0x55d1a8f9c2a0, access_size=4 bytes\nAborted\n",
+      "outputTruncated": false
+    },
+    "violation": {
+      "violationType": "OUT_OF_BOUNDS_OR_UAF",
+      "offendingAddress": "0x55d1a8f9c2a0",
+      "accessSizeBytes": 4,
+      "rawMessage": "MemoryGuard: VIOLATION DETECTED! Invalid access to ptr=0x55d1a8f9c2a0, access_size=4 bytes"
+    }
+  }
+}
+```
+
+- **Timeout Error (`504 Gateway Timeout`)**:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "TIMEOUT_ERROR",
+    "message": "Execution timed out after 5000ms.",
+    "jobId": "7f3b891a-4d2c-4e89-9a1b-123456789abc",
+    "details": {
+      "timedOut": true,
+      "outputTruncated": false
+    }
+  }
+}
+```
+
+- **Docker Unavailable Error (`503 Service Unavailable`)**:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "DOCKER_UNAVAILABLE",
+    "message": "Docker daemon is not running or unreachable.",
+    "jobId": "7f3b891a-4d2c-4e89-9a1b-123456789abc",
+    "details": {
+      "timedOut": false,
+      "outputTruncated": false
+    }
+  }
+}
+```
+
+#### `GET /api/execute/health`
+Checks whether the Docker daemon is accessible and reports container execution readiness.
+- **Status Code**: `200 OK`
+- **Response Example**:
+```json
+{
+  "success": true,
+  "message": "Docker execution environment is available and operational.",
+  "data": {
+    "available": true,
+    "version": "Docker version 29.2.1, build a4835de",
+    "image": "memoryguard-runner:latest"
+  }
+}
+```
 
 ---
 
 ### Current Limitations & Future Roadmap
 
-- **Sandbox Execution**: Generated executables are stored within unique workspaces ready for execution; safe process sandboxing (e.g. Docker, seccomp, or resource cgroups) will be integrated in subsequent phases.
-- **Authentication**: Endpoints currently operate without user authentication or persistent database queues.
-- **Frontend Integration**: Web UI components will be connected to these backend endpoints in Step 22+.
+- **Frontend Integration**: Web UI components will be connected to the compilation (`POST /api/compile`) and secure execution (`POST /api/execute`) backend in Step 22+.
+- **Authentication**: Endpoints currently operate in a local single-tenant mode without API key authentication.
+- **Custom STDIN Input**: Container execution currently supports command execution and static inputs; interactive terminal multiplexing (PTY) may be explored in future extensions.
 

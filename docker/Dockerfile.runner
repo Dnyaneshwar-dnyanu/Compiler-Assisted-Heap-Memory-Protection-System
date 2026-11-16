@@ -1,0 +1,31 @@
+# ==============================================================================
+# MemoryGuard Execution Sandbox Dockerfile
+# Minimal Linux runtime image for executing MemoryGuard instrumented binaries
+# ==============================================================================
+
+FROM debian:bookworm-slim
+
+# Install only the runtime shared libraries needed for C and C++ executions
+# (glibc, libstdc++6, libgcc_s).
+# LLVM compiler toolchain, Python, and Node.js are strictly omitted.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libstdc++6 \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create unprivileged non-root user and group (UID/GID: 10001)
+RUN groupadd -g 10001 mguser && \
+    useradd -u 10001 -g mguser -s /bin/false -M -d /nonexistent mguser
+
+# Dedicated execution directory
+WORKDIR /app
+
+# Non-root user ownership
+RUN chown -R mguser:mguser /app
+
+# Switch to dedicated non-root user
+USER 10001:10001
+
+# Entrypoint executes the read-only mounted executable
+ENTRYPOINT ["/app/program.bin"]
