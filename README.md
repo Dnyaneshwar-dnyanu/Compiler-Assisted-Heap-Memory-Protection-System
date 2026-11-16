@@ -84,6 +84,7 @@ MemoryGuard operates in two primary phases:
 | **Step 19** | Node.js Backend Foundation | Completed | Modular Express backend with health, system diagnostics, validated compile placeholder, and test suite. |
 | **Step 20** | LLVM Compiler Integration | Completed | Integrated Clang 18, Opt, and MemoryGuard pass plugin with Express backend for automated compilation, instrumentation, and linking. |
 | **Step 21** | Secure Docker Runtime Execution | Completed | Isolated container runtime execution service (`POST /api/execute`) enforcing strict Docker security hardening, read-only binary mounts, resource quotas, and diagnostic parsing. |
+| **Step 22** | Modern React Developer Frontend | Completed | Polished developer UI with Monaco Editor (C/C++), real-time compilation pipeline, analysis metrics dashboard, and Docker execution sandbox monitoring. |
 
 ---
 
@@ -94,6 +95,41 @@ MemoryGuard operates in two primary phases:
 ├── CMakeLists.txt                 # Top-level build configuration (C11, C++17, CTest)
 ├── docker/
 │   └── Dockerfile.runner          # Minimal root Dockerfile for debian:bookworm-slim runner
+├── frontend/                      # React 18 + Vite developer frontend (Step 22)
+│   ├── package.json               # Frontend dependencies (React, Monaco, Lucide, Tailwind, Vitest)
+│   ├── vite.config.js             # Vite configuration with /api reverse proxy and Vitest setup
+│   ├── tailwind.config.js         # Tailwind CSS styling configuration
+│   ├── index.html                 # HTML application entry point
+│   ├── .env.example               # Configurable VITE_API_BASE_URL
+│   ├── src/
+│   │   ├── components/            # Modular React UI components
+│   │   │   ├── Header/            # Brand header, title, and backend/Docker status indicators
+│   │   │   ├── Toolbar/           # Language switcher (C/C++), preset samples, compile & run buttons
+│   │   │   ├── Editor/            # Monaco code editor with syntax highlighting and presets
+│   │   │   │   ├── CodeEditor.jsx # Monaco integration with test environment fallback
+│   │   │   │   └── sampleCodes.js # Preset security test programs (clean, OOB, UAF, arithmetic)
+│   │   │   ├── OutputPanel/       # Container output streams, exit metrics, and violation card
+│   │   │   ├── DiagnosticsPanel/  # Compiler pipeline stages (Clang, Opt, Linker) & error logs
+│   │   │   ├── AnalysisSummary/   # LLVM pass analysis metrics dashboard (11 actual counters)
+│   │   │   └── StatusIndicator/   # Reusable status badges and stage indicators
+│   │   ├── services/              # API abstraction layer
+│   │   │   ├── api.js             # Standardized fetch client with ApiError handling
+│   │   │   ├── compilerService.js # POST /api/compile service
+│   │   │   └── executionService.js# POST /api/execute and GET /api/execute/health service
+│   │   ├── hooks/                 # Custom React hooks
+│   │   │   └── useBackendHealth.js# Health probe monitoring backend and Docker readiness
+│   │   ├── utils/                 # Formatting utilities
+│   │   │   └── formatters.js      # Duration, byte, pointer, and status formatting
+│   │   ├── App.jsx                # Main split-pane application shell and state coordinator
+│   │   ├── main.jsx               # React DOM root mounting
+│   │   └── index.css              # Tailwind directives and custom scrollbars
+│   └── tests/                     # Frontend automated test suite (26 tests via Vitest)
+│       ├── setup.js               # Vitest DOM polyfills and test cleanup
+│       ├── apiServices.test.js    # API client and service unit tests
+│       ├── Toolbar.test.jsx       # Toolbar and action button unit tests
+│       ├── OutputPanel.test.jsx   # Runtime output and violation card tests
+│       ├── AnalysisSummary.test.jsx# Metrics dashboard rendering and N/A fallback tests
+│       └── App.test.jsx           # End-to-end frontend integration tests
 ├── backend/                       # Node.js Express backend (Steps 19, 20 & 21)
 │   ├── package.json               # Backend dependencies, scripts, and engine specifications
 │   ├── .env.example               # Template environment configuration (LLVM toolchain & Docker settings)
@@ -660,9 +696,53 @@ Checks whether the Docker daemon is accessible and reports container execution r
 
 ---
 
+### Step 22: MemoryGuard React Developer Frontend
+
+MemoryGuard provides a high-performance web interface built with **React 18**, **Vite**, **Tailwind CSS**, and **Monaco Editor**, enabling interactive source editing, real-time compilation, memory-safety inspection, and secure containerized execution.
+
+#### Core Capabilities
+
+1. **Monaco Code Editor**:
+   - Full syntax highlighting for C (C11) and C++ (C++17).
+   - Independent code buffers preserving edits across language switching.
+   - Built-in sample programs illustrating clean memory access, out-of-bounds writes, use-after-free, and pointer arithmetic.
+2. **Real-Time Compiler & Pass Diagnostics**:
+   - Visual tracking of the 3-stage compilation pipeline (`FRONTEND_COMPILATION`, `INSTRUMENTATION`, `LINKING`) with millisecond timings.
+   - Raw Clang and LLVM pass build logs with syntax highlighting.
+3. **Analysis Dashboard**:
+   - Displays all 11 empirical MemoryGuard analysis counters:
+     - `checksInserted` (calls to `@mg_check_access`)
+     - `heapAccessesIdentified`
+     - `allocatorCallsRewritten`
+     - `totalAccessesExamined`
+     - `nonHeapSkipped`, `unknownOriginSkipped`, `volatileAccessesInstrumented`, `atomicOperationsSkipped`, `unsupportedAddressSpaceSkipped`, `scalableVectorSkipped`, `incompatibleAllocatorCallsSkipped`
+   - Highlights analyzed function control-flow graphs.
+4. **Runtime Output & Violation Explorer**:
+   - Isolated execution within ephemeral Docker containers.
+   - Automatic classification: `no_violations_detected`, `violation_detected`, `execution_failed`, and `output_truncated`.
+   - Dedicated MemoryGuard violation card displaying the offending pointer address, access size, and SIGABRT diagnostic.
+   - Filterable console output tabs (Combined, Stdout, Stderr).
+5. **Live Health Monitoring**:
+   - Real-time indicator pills for backend Node.js server connectivity and Docker daemon readiness.
+
+#### Frontend Scripts
+
+```bash
+# Start Vite development server (proxies /api requests to http://localhost:5000)
+npm --prefix frontend run dev
+
+# Run automated Vitest test suite (26 unit & integration tests)
+npm --prefix frontend test
+
+# Build production bundle
+npm --prefix frontend run build
+```
+
+---
+
 ### Current Limitations & Future Roadmap
 
-- **Frontend Integration**: Web UI components will be connected to the compilation (`POST /api/compile`) and secure execution (`POST /api/execute`) backend in Step 22+.
+- **Interactive Standard Input**: Container execution currently supports static execution; interactive terminal multiplexing (PTY) may be explored in future extensions.
+- **Persistent Job History**: Workspaces are currently tied to ephemeral job UUIDs; persistent history with database backends may be added.
 - **Authentication**: Endpoints currently operate in a local single-tenant mode without API key authentication.
-- **Custom STDIN Input**: Container execution currently supports command execution and static inputs; interactive terminal multiplexing (PTY) may be explored in future extensions.
 
