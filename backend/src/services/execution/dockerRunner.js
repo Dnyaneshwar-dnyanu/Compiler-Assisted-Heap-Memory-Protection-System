@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { getExecutionConfig } from './executionConfig.js';
 
 let customSpawn = null;
+let removeContainerHook = null;
 
 /**
  * For testing and mock injection.
@@ -11,14 +12,22 @@ export function setCustomSpawn(fn) {
   customSpawn = fn;
 }
 
+export function setRemoveContainerHook(fn) {
+  removeContainerHook = fn;
+}
+
 export function resetCustomSpawn() {
   customSpawn = null;
+  removeContainerHook = null;
 }
 
 /**
  * Safely removes a container by name if it exists.
  */
 export function removeContainer(containerName, dockerBin = 'docker') {
+  if (removeContainerHook) {
+    try { removeContainerHook(containerName); } catch {}
+  }
   return new Promise((resolve) => {
     try {
       const killer = spawn(dockerBin, ['rm', '-f', containerName], {
