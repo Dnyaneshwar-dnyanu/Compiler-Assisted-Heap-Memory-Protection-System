@@ -4,6 +4,25 @@ import { getExecutionConfig } from './executionConfig.js';
 
 let customSpawn = null;
 let removeContainerHook = null;
+let runnerTestOverrides = null;
+
+/**
+ * Non-negotiable, immutable Docker security restrictions.
+ * These flags are strictly enforced and can NEVER be overridden by any caller.
+ */
+export const IMMUTABLE_SECURITY = Object.freeze({
+  network: 'none',
+  readOnly: true,
+  capDrop: 'ALL',
+  securityOpt: 'no-new-privileges',
+  userUidGid: '10001:10001',
+  memoryLimit: '64m',
+  cpuLimit: '0.5',
+  pidsLimit: 32,
+  tmpfsMount: '/tmp:rw,noexec,nosuid,size=16m',
+  init: true,
+  rm: true
+});
 
 /**
  * For testing and mock injection.
@@ -16,9 +35,22 @@ export function setRemoveContainerHook(fn) {
   removeContainerHook = fn;
 }
 
+/**
+ * Sets private internal test overrides for non-security settings (e.g. executionTimeoutMs, maxOutputBytes).
+ * Security settings (network, privileges, user, caps, mounts, memory, cpu, pids) CANNOT be overridden.
+ */
+export function setRunnerTestOverrides(overrides) {
+  runnerTestOverrides = overrides ? { ...overrides } : null;
+}
+
+export function resetRunnerTestOverrides() {
+  runnerTestOverrides = null;
+}
+
 export function resetCustomSpawn() {
   customSpawn = null;
   removeContainerHook = null;
+  runnerTestOverrides = null;
 }
 
 /**
@@ -47,36 +79,62 @@ export function removeContainer(containerName, dockerBin = 'docker') {
 
 /**
  * Runs the compiled binary in an isolated Docker container with strict security bounds.
+ *
+ * All security flags (network isolation, user privileges, resource ceilings,
+ * dropped capabilities, read-only rootfs, read-only program mount, and noexec tmpfs)
+ * are strictly immutable and derived exclusively from backend security configuration.
+ *
+ * Only non-security testing parameters (executionTimeoutMs, maxOutputBytes) may be
+ * configured via internal test hooks or _internalTestOverrides.
  */
 export async function runContainer({
   executablePath,
-  customConfig = {},
+  _internalTestOverrides = null,
+  customConfig = null,
   abortSignal = null
 }) {
-  const cfg = { ...getExecutionConfig(), ...customConfig };
+  const baseCfg = getExecutionConfig();
+
+  // Combine private internal test overrides if provided (priority: parameter > module hook)
+  const rawOverrides = _internalTestOverrides || customConfig || runnerTestOverrides || {};
+
+  // Strictly filter overrides: only non-security execution parameters are allowed
+  const safeOverrides = {};
+  if (typeof rawOverrides.executionTimeoutMs === 'number' && rawOverrides.executionTimeoutMs > 0) {
+    safeOverrides.executionTimeoutMs = rawOverrides.executionTimeoutMs;
+  }
+  if (typeof rawOverrides.maxOutputBytes === 'number' && rawOverrides.maxOutputBytes > 0) {
+    safeOverrides.maxOutputBytes = rawOverrides.maxOutputBytes;
+  }
+
+  const executionTimeoutMs = safeOverrides.executionTimeoutMs ?? baseCfg.executionTimeoutMs;
+  const maxOutputBytes = safeOverrides.maxOutputBytes ?? baseCfg.maxOutputBytes;
+  const dockerBin = baseCfg.dockerBin;
+  const imageName = baseCfg.imageName;
+
   const containerName = `mg-exec-${crypto.randomUUID()}`;
   const startTime = Date.now();
 
   const spawnFn = customSpawn || spawn;
 
-  // Build explicit argument array for Docker
+  // Build explicit argument array for Docker using strictly immutable security flags.
   // Absolute host path must be mounted read-only to /app/program.bin
   const dockerArgs = [
     'run',
     '--name', containerName,
     '--rm',
-    '--network', cfg.network,
+    '--network', IMMUTABLE_SECURITY.network,
     '--read-only',
-    '--cap-drop', cfg.capDrop,
-    '--security-opt', cfg.securityOpt,
-    '--user', cfg.userUidGid,
-    '--memory', cfg.memoryLimit,
-    '--cpus', String(cfg.cpuLimit),
-    '--pids-limit', String(cfg.pidsLimit),
+    '--cap-drop', IMMUTABLE_SECURITY.capDrop,
+    '--security-opt', IMMUTABLE_SECURITY.securityOpt,
+    '--user', IMMUTABLE_SECURITY.userUidGid,
+    '--memory', IMMUTABLE_SECURITY.memoryLimit,
+    '--cpus', String(IMMUTABLE_SECURITY.cpuLimit),
+    '--pids-limit', String(IMMUTABLE_SECURITY.pidsLimit),
     '--init',
-    '--tmpfs', cfg.tmpfsMount,
+    '--tmpfs', IMMUTABLE_SECURITY.tmpfsMount,
     '-v', `${executablePath}:/app/program.bin:ro`,
-    cfg.imageName
+    imageName
   ];
 
   let stdoutChunks = [];
@@ -89,7 +147,7 @@ export async function runContainer({
 
   let child;
   try {
-    child = spawnFn(cfg.dockerBin, dockerArgs, {
+    child = spawnFn(dockerBin, dockerArgs, {
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false
     });
@@ -114,7 +172,7 @@ export async function runContainer({
     try {
       child.kill('SIGKILL');
     } catch {}
-    removeContainer(containerName, cfg.dockerBin);
+    removeContainer(containerName, dockerBin);
   };
 
   if (abortSignal) {
@@ -135,7 +193,7 @@ export async function runContainer({
 
     // Escalate to docker kill to stop container inside daemon immediately
     try {
-      const killer = spawn(cfg.dockerBin, ['kill', containerName], { stdio: 'ignore' });
+      const killer = spawn(dockerBin, ['kill', containerName], { stdio: 'ignore' });
       killer.unref();
     } catch {}
 
@@ -143,17 +201,17 @@ export async function runContainer({
       try {
         child.kill('SIGKILL');
       } catch {}
-      removeContainer(containerName, cfg.dockerBin);
+      removeContainer(containerName, dockerBin);
     }, 1000);
     killTimer.unref();
-  }, cfg.executionTimeoutMs);
+  }, executionTimeoutMs);
 
   child.stdout?.on('data', (chunk) => {
-    if (stdoutBytes + chunk.length <= cfg.maxOutputBytes) {
+    if (stdoutBytes + chunk.length <= maxOutputBytes) {
       stdoutChunks.push(chunk);
       stdoutBytes += chunk.length;
-    } else if (stdoutBytes < cfg.maxOutputBytes) {
-      const allowed = cfg.maxOutputBytes - stdoutBytes;
+    } else if (stdoutBytes < maxOutputBytes) {
+      const allowed = maxOutputBytes - stdoutBytes;
       stdoutChunks.push(chunk.subarray(0, allowed));
       stdoutBytes += allowed;
       outputTruncated = true;
@@ -163,11 +221,11 @@ export async function runContainer({
   });
 
   child.stderr?.on('data', (chunk) => {
-    if (stderrBytes + chunk.length <= cfg.maxOutputBytes) {
+    if (stderrBytes + chunk.length <= maxOutputBytes) {
       stderrChunks.push(chunk);
       stderrBytes += chunk.length;
-    } else if (stderrBytes < cfg.maxOutputBytes) {
-      const allowed = cfg.maxOutputBytes - stderrBytes;
+    } else if (stderrBytes < maxOutputBytes) {
+      const allowed = maxOutputBytes - stderrBytes;
       stderrChunks.push(chunk.subarray(0, allowed));
       stderrBytes += allowed;
       outputTruncated = true;
@@ -183,7 +241,7 @@ export async function runContainer({
       if (abortSignal) {
         abortSignal.removeEventListener('abort', abortHandler);
       }
-      removeContainer(containerName, cfg.dockerBin);
+      removeContainer(containerName, dockerBin);
 
       resolve({
         success: false,
@@ -211,7 +269,7 @@ export async function runContainer({
       const stderr = Buffer.concat(stderrChunks).toString('utf8');
 
       // Make sure container is completely cleaned up
-      await removeContainer(containerName, cfg.dockerBin);
+      await removeContainer(containerName, dockerBin);
 
       // Check for image missing or daemon down errors in docker output
       let errorCategory = null;
@@ -219,13 +277,13 @@ export async function runContainer({
 
       if (stderr.includes('Unable to find image') || stderr.includes('pull access denied') || stderr.includes('repository does not exist')) {
         errorCategory = 'IMAGE_NOT_FOUND';
-        message = `Execution container image '${cfg.imageName}' is not available locally.`;
+        message = `Execution container image '${imageName}' is not available locally.`;
       } else if (stderr.includes('Cannot connect to the Docker daemon') || stderr.includes('failed to connect to the docker API') || stderr.includes('daemon is not running')) {
         errorCategory = 'DOCKER_UNAVAILABLE';
         message = 'Docker daemon is not running or unreachable.';
       } else if (timedOut) {
         errorCategory = 'TIMEOUT_ERROR';
-        message = `Execution timed out after ${cfg.executionTimeoutMs}ms.`;
+        message = `Execution timed out after ${executionTimeoutMs}ms.`;
       } else if (aborted) {
         errorCategory = 'ABORTED';
         message = 'Execution aborted by client disconnect.';

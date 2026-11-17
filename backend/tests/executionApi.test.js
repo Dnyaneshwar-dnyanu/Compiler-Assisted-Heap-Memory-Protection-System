@@ -6,7 +6,7 @@ import { EventEmitter } from 'node:events';
 import request from 'supertest';
 import app from '../src/app.js';
 import { createWorkspace, writeSource, cleanupWorkspace } from '../src/services/compiler/workspaceManager.js';
-import { setCustomSpawn, resetCustomSpawn } from '../src/services/execution/dockerRunner.js';
+import { setCustomSpawn, resetCustomSpawn, setRunnerTestOverrides } from '../src/services/execution/dockerRunner.js';
 
 describe('POST /api/execute (Runtime Execution Sandbox API)', () => {
   let testWorkspace;
@@ -293,6 +293,9 @@ describe('POST /api/execute (Runtime Execution Sandbox API)', () => {
     const binPath = path.join(testWorkspace.workspaceDir, 'program.bin');
     fs.writeFileSync(binPath, 'dummy binary');
 
+    // Use internal test runner hook instead of client-controlled request body
+    setRunnerTestOverrides({ executionTimeoutMs: 15 });
+
     setCustomSpawn((cmd, args = []) => {
       const emitter = new EventEmitter();
       emitter.stdout = new EventEmitter();
@@ -312,8 +315,7 @@ describe('POST /api/execute (Runtime Execution Sandbox API)', () => {
     const res = await request(app)
       .post('/api/execute')
       .send({
-        jobId: testWorkspace.jobId,
-        customConfig: { executionTimeoutMs: 15 }
+        jobId: testWorkspace.jobId
       });
 
     assert.equal(res.status, 504);

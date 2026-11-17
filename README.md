@@ -86,6 +86,7 @@ MemoryGuard operates in two primary phases:
 | **Step 21** | Secure Docker Runtime Execution | Completed | Isolated container runtime execution service (`POST /api/execute`) enforcing strict Docker security hardening, read-only binary mounts, resource quotas, and diagnostic parsing. |
 | **Step 22** | Modern React Developer Frontend | Completed | Polished developer UI with Monaco Editor (C/C++), real-time compilation pipeline, analysis metrics dashboard, and Docker execution sandbox monitoring. |
 | **Step 23** | End-to-End Integration & Security Verification | Completed | Comprehensive integration suite covering browser-to-container workflows, security regression scenarios, job/workspace isolation, Docker hardening, and empirical performance metrics. |
+| **Step 24** | Docker Security Lockdown & Tamper Resistance | Completed | Hardened Docker sandbox orchestration by removing client-controlled `customConfig` from the HTTP API, freezing non-negotiable security flags (`IMMUTABLE_SECURITY`), and adding tamper-resistance regression tests. |
 
 ---
 
@@ -839,13 +840,13 @@ Benchmarked using `backend/scripts/measurePerformance.js` on 1,000-element heap 
 #### 7. Comprehensive Test Commands
 
 ```bash
-# 1. Run all backend tests (83 tests: 57 unit + 26 integration)
+# 1. Run all backend tests (94 tests: 57 unit + 37 integration)
 npm --prefix backend test
 
 # 2. Run backend unit tests only (57 tests)
 npm --prefix backend run test:unit
 
-# 3. Run backend integration & security tests only (26 tests)
+# 3. Run backend integration & security tests only (37 tests)
 npm --prefix backend run test:integration
 
 # 4. Run frontend tests (30 unit & E2E workflow tests via Vitest)
@@ -857,6 +858,37 @@ wsl bash -c "cd '/mnt/d/Notes/SEM VII/Compiler Design/Project' && ctest --test-d
 # 6. Run automated performance & reliability measurement script
 node backend/scripts/measurePerformance.js
 ```
+
+---
+
+### Step 24: Docker Security Lockdown & Hardened Tamper Resistance
+
+During security auditing, a critical vulnerability was addressed where `POST /api/execute` accepted a `customConfig` object directly from the client request body and merged it over default runner options, potentially allowing attackers to override Docker isolation settings.
+
+#### Key Security Remediations
+
+1. **Complete Removal of API-Controlled Configuration**:
+   - `backend/src/controllers/executionController.js` strictly extracts only `{ jobId }` from `req.body`.
+   - Any client payload attempting to supply `customConfig`, `--privileged`, `network`, `userUidGid`, or arbitrary mounts is completely dropped.
+2. **Immutable Security Architecture (`IMMUTABLE_SECURITY`)**:
+   - In `backend/src/services/execution/dockerRunner.js`, non-negotiable security flags are defined in a frozen constant and directly applied to `dockerArgs`:
+     - `--network none` (Complete network isolation)
+     - `--read-only` (Immutable root filesystem)
+     - `--cap-drop ALL` (Zero Linux capabilities)
+     - `--security-opt no-new-privileges` (No privilege escalation)
+     - `--user 10001:10001` (Unprivileged runner user `mguser`)
+     - `--memory 64m` (Hard memory quota)
+     - `--cpus 0.5` (Hard CPU quota)
+     - `--pids-limit 32` (Fork bomb prevention)
+     - `--init` & `--rm` (Ephemeral execution and zombie process reaping)
+     - `--tmpfs /tmp:rw,noexec,nosuid,size=16m` (Restricted writable scratch space)
+     - `-v <executable>:/app/program.bin:ro` (Strict single-file read-only mount)
+   - These flags cannot be overridden by any parameter, payload, or module caller.
+3. **Internal Test Isolation**:
+   - Internal test harnesses requiring non-security overrides (such as `executionTimeoutMs` or `maxOutputBytes`) use private runner injection (`setRunnerTestOverrides` / `resetRunnerTestOverrides`) or `_internalTestOverrides`.
+   - Security parameters are strictly ignored even if passed to internal test hooks.
+4. **Dedicated Tamper-Resistance Regression Suite**:
+   - `backend/tests/integration/dockerSecurityLockdown.test.js` provides 11 targeted regression tests confirming that attempts to override network, user privileges, read-only rootfs, capabilities, privileged mode, resource quotas, or volume mounts via HTTP or direct invocation are fully neutralized.
 
 ---
 

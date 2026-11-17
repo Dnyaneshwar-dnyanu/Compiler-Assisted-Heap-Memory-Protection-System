@@ -20,8 +20,10 @@ function assertPathWithin(targetPath, allowedRoot) {
 
 /**
  * Coordinates secure Docker execution for a compiled job.
+ * Note: External callers and HTTP clients CANNOT override Docker security settings.
+ * Optional _internalTestOverrides is strictly for internal test harnesses (timeout / output limits).
  */
-export async function executeJob(jobId, { customConfig = {}, abortSignal = null } = {}) {
+export async function executeJob(jobId, { abortSignal = null, _internalTestOverrides = null } = {}) {
   // 1. Validate Job ID format
   if (!jobId || typeof jobId !== 'string') {
     return {
@@ -79,7 +81,7 @@ export async function executeJob(jobId, { customConfig = {}, abortSignal = null 
   // 4. Run inside secure Docker sandbox (never on host)
   const runResult = await runContainer({
     executablePath: mountExecutablePath,
-    customConfig,
+    _internalTestOverrides,
     abortSignal
   });
 

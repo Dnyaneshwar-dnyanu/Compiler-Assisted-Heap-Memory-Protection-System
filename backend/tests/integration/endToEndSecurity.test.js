@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import request from 'supertest';
 import EventEmitter from 'node:events';
 import app from '../../src/app.js';
-import { setCustomSpawn, resetCustomSpawn } from '../../src/services/execution/dockerRunner.js';
+import { setCustomSpawn, resetCustomSpawn, setRunnerTestOverrides } from '../../src/services/execution/dockerRunner.js';
 
 describe('End-to-End Security & Compiler Regression Suite', () => {
 
@@ -425,12 +425,10 @@ int main(void) {
     });
 
     try {
+      setRunnerTestOverrides({ executionTimeoutMs: 20 });
       const execRes = await request(app)
         .post('/api/execute')
-        .send({
-          jobId,
-          customConfig: { executionTimeoutMs: 20 }
-        });
+        .send({ jobId });
 
       assert.equal(execRes.status, 504);
       assert.equal(execRes.body.success, false);
@@ -475,12 +473,10 @@ int main(void) {
     });
 
     try {
+      setRunnerTestOverrides({ maxOutputBytes: 100 });
       const execRes = await request(app)
         .post('/api/execute')
-        .send({
-          jobId,
-          customConfig: { maxOutputBytes: 100 }
-        });
+        .send({ jobId });
 
       assert.equal(execRes.status, 200);
       assert.equal(execRes.body.data.status, 'output_truncated');
@@ -525,12 +521,10 @@ int main(void) {
     });
 
     try {
+      setRunnerTestOverrides({ maxOutputBytes: 120 });
       const execRes = await request(app)
         .post('/api/execute')
-        .send({
-          jobId,
-          customConfig: { maxOutputBytes: 120 }
-        });
+        .send({ jobId });
 
       assert.equal(execRes.status, 200);
       assert.equal(execRes.body.data.status, 'output_truncated');

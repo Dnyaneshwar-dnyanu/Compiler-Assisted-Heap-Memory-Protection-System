@@ -7,7 +7,10 @@ import { sendSuccess, sendError } from '../utils/apiResponse.js';
  */
 export async function executeProgram(req, res, next) {
   try {
-    const { jobId, customConfig } = req.body || {};
+    // Only extract jobId from request body.
+    // Client-supplied Docker configuration (e.g. customConfig) is strictly forbidden
+    // to prevent tampering with container isolation, privileges, or security bounds.
+    const { jobId } = req.body || {};
 
     if (!jobId) {
       return sendError(
@@ -28,7 +31,6 @@ export async function executeProgram(req, res, next) {
     });
 
     const result = await executeJob(jobId, {
-      customConfig: customConfig || {},
       abortSignal: abortController.signal
     });
 
