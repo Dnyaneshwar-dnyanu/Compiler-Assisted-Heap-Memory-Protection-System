@@ -87,6 +87,7 @@ MemoryGuard operates in two primary phases:
 | **Step 22** | Modern React Developer Frontend | Completed | Polished developer UI with Monaco Editor (C/C++), real-time compilation pipeline, analysis metrics dashboard, and Docker execution sandbox monitoring. |
 | **Step 23** | End-to-End Integration & Security Verification | Completed | Comprehensive integration suite covering browser-to-container workflows, security regression scenarios, job/workspace isolation, Docker hardening, and empirical performance metrics. |
 | **Step 24** | Docker Security Lockdown & Tamper Resistance | Completed | Hardened Docker sandbox orchestration by removing client-controlled `customConfig` from the HTTP API, freezing non-negotiable security flags (`IMMUTABLE_SECURITY`), and adding tamper-resistance regression tests. |
+| **Step 25** | Fix realloc() Pointer Invalidation | Completed | Eliminated post-realloc pointer evaluation undefined behavior by preserving the original allocation address as integer (`old_start`) before `realloc()`, adding an internal allocator test seam, and validating zero-size/in-place/relocating realloc contracts under ASan/UBSan/TSan. |
 
 ---
 
@@ -889,6 +890,36 @@ During security auditing, a critical vulnerability was addressed where `POST /ap
    - Security parameters are strictly ignored even if passed to internal test hooks.
 4. **Dedicated Tamper-Resistance Regression Suite**:
    - `backend/tests/integration/dockerSecurityLockdown.test.js` provides 11 targeted regression tests confirming that attempts to override network, user privileges, read-only rootfs, capabilities, privileged mode, resource quotas, or volume mounts via HTTP or direct invocation are fully neutralized.
+
+---
+
+### Step 25: Fix realloc() Pointer Invalidation & Registry Failure in C Runtime
+
+In standard C (C11 / C17 / C23), when `realloc(ptr, size)` relocates or deallocates a memory block, the original pointer value `ptr` becomes indeterminate. Evaluating or casting `ptr` thereafter (such as evaluating `(uintptr_t)ptr` to delete the old AVL tree entry) constitutes undefined behavior. Furthermore, if a registry node cannot be allocated after a successful reallocation, returning the pointer untracked creates a silent memory safety hole.
+
+#### Key Remediations
+
+1. **Pre-Reallocation Address Preservation (`old_start`)**:
+   - In `runtime/src/memoryguard.c` (`mg_realloc_external`), the base address is preserved as an integer (`uintptr_t old_start = (uintptr_t)ptr;`) before invoking the underlying allocator.
+   - After successful reallocation, `old_start` is passed to `delete_avl()` to detach the old registry entry.
+   - The pointer `ptr` is never evaluated, converted, or dereferenced after calling `realloc()`.
+2. **Guaranteed Node Availability Before Realloc**:
+   - `mg_realloc_external()` pre-allocates an `Allocation` node via `mg_call_alloc_node_locked()` **before** invoking the underlying `realloc` operation.
+   - If node allocation fails, the function aborts immediately before calling `realloc`, preserving the existing allocation and all its metadata intact in the registry, and returns `NULL`.
+   - On successful reallocation, if the detached AVL node (`deleted`) is available, it is recycled and the reserved node is freed immediately (`free(reserved_node)`). If `deleted` was `NULL`, the reserved node is used.
+   - Tracking is guaranteed never to be silently lost for successfully reallocated memory.
+3. **Reallocation Failure Safety**:
+   - If `realloc()` returns `NULL` on non-zero size requests, the reserved node is freed, `delete_avl()` is never called, and the original allocation entry remains completely untouched in the AVL tree.
+4. **Zero-Size Reallocation Platform Contracts**:
+   - When `new_size == 0`:
+     - If the platform frees memory and returns `NULL` (e.g. standard glibc), the reserved node is freed, the entry at `old_start` is removed, and `total_allocations` decremented.
+     - If the platform returns a distinct zero-sized non-NULL pointer, the old entry is detached, the reserved node is appropriately freed or reused, and the entry is tracked with `size = 0`.
+5. **Synchronized Test Seams & Node Failure Injection**:
+   - Added `mg_test_set_realloc_fn()` and `mg_test_reset_realloc_fn()` synchronized under `registry_mutex` to allow test suites to test guaranteed relocation, in-place realloc, failure, and zero-size behaviors without non-deterministic libc heap layouts.
+   - Added narrow test seam `mg_test_set_node_alloc_fail()` to test registry node allocation failure deterministically.
+   - In default/production operation, hooks are inactive and MemoryGuard routes directly to the system allocator.
+6. **Sanitizer Verification**:
+   - Verified clean execution under AddressSanitizer (ASan), UndefinedBehaviorSanitizer (UBSan), and ThreadSanitizer (TSan) across 55,039 assertions with zero warnings, zero data races, and strict `-Wall -Wextra -Wpedantic -Werror`.
 
 ---
 

@@ -247,6 +247,44 @@ void mg_intercept_free(void *ptr);
  */
 int mg_verify_tree_invariants(void);
 
+/* =========================================================================
+ * Internal Test Seams
+ *
+ * These hooks are strictly for deterministic unit and regression testing
+ * of allocation failure, pointer relocation, in-place realloc, and edge
+ * cases. They must NEVER be used in production code. In production,
+ * MemoryGuard always routes directly to the genuine system allocator.
+ * All test seam operations are synchronized via registry_mutex.
+ * ========================================================================= */
+
+/**
+ * @brief Function signature for custom realloc test hook.
+ */
+typedef void *(*mg_realloc_fn_t)(void *ptr, size_t size);
+
+/**
+ * @brief Internal allocator test seam: sets a custom realloc function hook for deterministic testing.
+ * Thread-safe: synchronized under the registry mutex.
+ * Pass NULL to restore the default libc realloc.
+ *
+ * @param fn Custom realloc function, or NULL to reset.
+ */
+void mg_test_set_realloc_fn(mg_realloc_fn_t fn);
+
+/**
+ * @brief Internal allocator test seam: resets realloc hook to standard libc realloc.
+ * Thread-safe: synchronized under the registry mutex.
+ */
+void mg_test_reset_realloc_fn(void);
+
+/**
+ * @brief Internal allocator test seam: simulates registry node allocation failure.
+ * Thread-safe: synchronized under the registry mutex.
+ *
+ * @param fail 1 to force node allocation failure, 0 to restore normal allocation.
+ */
+void mg_test_set_node_alloc_fail(int fail);
+
 #ifdef __cplusplus
 }
 #endif

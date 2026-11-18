@@ -515,51 +515,134 @@ int mg_unregister_external(void *ptr) {
     return 0;
 }
 
+/* =========================================================================
+ * Internal Test Seams
+ *
+ * Synchronized under registry_mutex so concurrent test execution cannot
+ * race with test hook updates. When hooks are NULL/0 (the default state),
+ * the runtime invokes the real system allocator and malloc directly.
+ * ========================================================================= */
+static mg_realloc_fn_t mg_realloc_hook = NULL;
+static int mg_test_force_node_alloc_fail = 0;
+
+void mg_test_set_realloc_fn(mg_realloc_fn_t fn) {
+    pthread_mutex_lock(&registry_mutex);
+    mg_realloc_hook = fn;
+    pthread_mutex_unlock(&registry_mutex);
+}
+
+void mg_test_reset_realloc_fn(void) {
+    pthread_mutex_lock(&registry_mutex);
+    mg_realloc_hook = NULL;
+    pthread_mutex_unlock(&registry_mutex);
+}
+
+void mg_test_set_node_alloc_fail(int fail) {
+    pthread_mutex_lock(&registry_mutex);
+    mg_test_force_node_alloc_fail = fail;
+    pthread_mutex_unlock(&registry_mutex);
+}
+
+/**
+ * @brief Invokes the active realloc implementation.
+ * MUST be called with registry_mutex held to prevent data races.
+ */
+static inline void *mg_call_realloc_locked(void *ptr, size_t size) {
+    if (mg_realloc_hook != NULL) {
+        return mg_realloc_hook(ptr, size);
+    }
+    return realloc(ptr, size);
+}
+
+/**
+ * @brief Allocates an Allocation metadata node.
+ * MUST be called with registry_mutex held.
+ */
+static inline Allocation *mg_call_alloc_node_locked(void) {
+    if (mg_test_force_node_alloc_fail) {
+        return NULL;
+    }
+    return (Allocation *)malloc(sizeof(Allocation));
+}
+
 void *mg_realloc_external(void *ptr, size_t new_size) {
     if (ptr == NULL) {
-        return realloc(NULL, new_size);
+        pthread_mutex_lock(&registry_mutex);
+        void *res = mg_call_realloc_locked(NULL, new_size);
+        pthread_mutex_unlock(&registry_mutex);
+        return res;
     }
+
+    /* Preserve the original allocation address as an integer before realloc.
+     * In ISO C, once realloc deallocates or relocates the memory pointed to by ptr,
+     * the pointer value of ptr becomes indeterminate. Evaluating ptr thereafter
+     * (including (uintptr_t)ptr or pointer comparisons) constitutes undefined behavior.
+     * Preserving old_start as an integer ensures safe AVL unlinking post-reallocation. */
+    uintptr_t old_start = (uintptr_t)ptr;
 
     pthread_mutex_lock(&registry_mutex);
     Allocation *curr = find_allocation_locked(ptr);
 
     if (curr == NULL) {
+        /* Pointer is untracked; pass through to system realloc without tracking */
+        void *res = mg_call_realloc_locked(ptr, new_size);
         pthread_mutex_unlock(&registry_mutex);
-        return realloc(ptr, new_size);
+        return res;
     }
 
     int owns = curr->owns_payload;
 
+    /* Step 25 Remediation: Ensure a registry node is guaranteed to be available
+     * BEFORE calling the underlying realloc operation. If node allocation fails,
+     * abort immediately without touching the existing allocation, leaving its
+     * registry entry, bounds, and owns_payload completely intact. */
+    Allocation *reserved_node = mg_call_alloc_node_locked();
+    if (reserved_node == NULL) {
+        pthread_mutex_unlock(&registry_mutex);
+        return NULL;
+    }
+
     if (new_size == 0) {
-        void *new_ptr = realloc(ptr, 0);
+        void *new_ptr = mg_call_realloc_locked(ptr, 0);
+        /* Note: ptr is indeterminate after this point if realloc freed it; do not reference ptr */
         if (new_ptr != NULL) {
             /* Platform returned a non-null zero-sized buffer */
             Allocation *deleted = NULL;
-            allocation_registry_root = delete_avl(allocation_registry_root, curr->start, &deleted);
+            allocation_registry_root = delete_avl(allocation_registry_root, old_start, &deleted);
 
-            curr->address = new_ptr;
-            curr->start = (uintptr_t)new_ptr;
-            curr->size = 0;
-            curr->end = curr->start;
-            curr->max_end = curr->end;
-            curr->owns_payload = owns;
-            curr->height = 1;
-            curr->left = NULL;
-            curr->right = NULL;
+            Allocation *node = NULL;
+            if (deleted != NULL) {
+                node = deleted;
+                free(reserved_node); /* Reuse deleted AVL node; release unused reserved node */
+            } else {
+                node = reserved_node;
+                total_allocations++;
+            }
+
+            node->address = new_ptr;
+            node->start = (uintptr_t)new_ptr;
+            node->size = 0;
+            node->end = node->start;
+            node->max_end = node->end;
+            node->owns_payload = owns;
+            node->height = 1;
+            node->left = NULL;
+            node->right = NULL;
 
             int inserted = 0;
-            allocation_registry_root = insert_avl(allocation_registry_root, curr, &inserted);
+            allocation_registry_root = insert_avl(allocation_registry_root, node, &inserted);
             if (!inserted) {
                 total_allocations--;
-                free(curr);
+                free(node);
             }
             pthread_mutex_unlock(&registry_mutex);
             return new_ptr;
         } else {
             /* Platform freed the buffer and returned NULL */
+            free(reserved_node); /* Release unused reserved node */
             Allocation *deleted = NULL;
-            allocation_registry_root = delete_avl(allocation_registry_root, (uintptr_t)ptr, &deleted);
-            if (deleted) {
+            allocation_registry_root = delete_avl(allocation_registry_root, old_start, &deleted);
+            if (deleted != NULL) {
                 total_allocations--;
                 free(deleted);
             }
@@ -569,32 +652,44 @@ void *mg_realloc_external(void *ptr, size_t new_size) {
     }
 
     /* new_size > 0 */
-    void *new_ptr = realloc(ptr, new_size);
+    void *new_ptr = mg_call_realloc_locked(ptr, new_size);
+    /* Note: ptr is indeterminate after this point if realloc relocated it; do not reference ptr */
     if (new_ptr == NULL) {
-        /* Realloc failed: standard realloc preserves original allocation untouched */
+        /* Reallocation failed: standard realloc preserves original allocation untouched.
+         * Preserve existing allocation registry entry and release unused reserved node. */
+        free(reserved_node);
         pthread_mutex_unlock(&registry_mutex);
         return NULL;
     }
 
-    /* Reallocation succeeded: re-insert into AVL tree to guarantee correct balance and max_end */
+    /* Reallocation succeeded: remove original AVL entry using old_start (never ptr) and re-insert */
     Allocation *deleted = NULL;
-    allocation_registry_root = delete_avl(allocation_registry_root, (uintptr_t)ptr, &deleted);
+    allocation_registry_root = delete_avl(allocation_registry_root, old_start, &deleted);
 
-    curr->address = new_ptr;
-    curr->start = (uintptr_t)new_ptr;
-    curr->size = new_size;
-    curr->end = calculate_end(curr->start, new_size);
-    curr->max_end = curr->end;
-    curr->owns_payload = owns;
-    curr->height = 1;
-    curr->left = NULL;
-    curr->right = NULL;
+    Allocation *node = NULL;
+    if (deleted != NULL) {
+        node = deleted;
+        free(reserved_node); /* Reuse deleted AVL node; release unused reserved node */
+    } else {
+        node = reserved_node;
+        total_allocations++;
+    }
+
+    node->address = new_ptr;
+    node->start = (uintptr_t)new_ptr;
+    node->size = new_size;
+    node->end = calculate_end(node->start, new_size);
+    node->max_end = node->end;
+    node->owns_payload = owns;
+    node->height = 1;
+    node->left = NULL;
+    node->right = NULL;
 
     int inserted = 0;
-    allocation_registry_root = insert_avl(allocation_registry_root, curr, &inserted);
+    allocation_registry_root = insert_avl(allocation_registry_root, node, &inserted);
     if (!inserted) {
         total_allocations--;
-        free(curr);
+        free(node);
     }
 
     pthread_mutex_unlock(&registry_mutex);

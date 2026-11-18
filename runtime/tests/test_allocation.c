@@ -466,11 +466,12 @@ static void test_external_allocations(void) {
     TEST_ASSERT(mg_register_external(zero_target_p, zero_realloc_size) == 1, "Registered buffer for realloc(ptr, 0) test");
     TEST_ASSERT(mg_get_tracked_count() == initial_count + 1, "Registry count incremented before realloc(ptr, 0)");
 
+    uintptr_t zero_old_addr = (uintptr_t)zero_target_p;
     void *zero_res = mg_realloc_external(zero_target_p, 0);
     if (zero_res == NULL) {
         /* Standard platform behavior (e.g. glibc): buffer was freed and NULL returned */
         TEST_ASSERT(mg_get_tracked_count() == initial_count, "Registry entry removed when realloc(ptr, 0) returns NULL");
-        TEST_ASSERT(mg_is_tracked(zero_target_p) == 0, "Original pointer no longer tracked");
+        TEST_ASSERT(mg_is_tracked((const void *)zero_old_addr) == 0, "Original pointer no longer tracked");
     } else {
         /* Platform returned a distinct non-dereferenceable zero-sized pointer */
         TEST_ASSERT(mg_is_tracked(zero_res) == 1, "Zero-size realloc pointer is tracked");
@@ -1401,15 +1402,15 @@ static void test_realloc_address_relocation_stress(void) {
     /* 2. Reallocate to significantly larger sizes to force memory relocation */
     int relocations_observed = 0;
     for (int i = 0; i < RELOC_COUNT; i++) {
-        void *old_p = ptrs[i];
+        uintptr_t old_addr = (uintptr_t)ptrs[i];
         size_t new_sz = 8192 + (size_t)(i * 32);
-        void *new_p = mg_realloc_external(old_p, new_sz);
+        void *new_p = mg_realloc_external(ptrs[i], new_sz);
         TEST_ASSERT(new_p != NULL, "Realloc relocation succeeded");
 
-        if (new_p != old_p) {
+        if ((uintptr_t)new_p != old_addr) {
             relocations_observed++;
-            /* The old pointer must no longer be tracked */
-            TEST_ASSERT(mg_is_tracked(old_p) == 0, "Old pointer no longer tracked after relocation");
+            /* The old address must no longer be tracked */
+            TEST_ASSERT(mg_is_tracked((const void *)old_addr) == 0, "Old address no longer tracked after relocation");
         }
 
         /* Verify data preservation */
@@ -1531,6 +1532,322 @@ static void test_multithreaded_concurrent_tree_stress(void) {
                 "Tree invariants hold after multithreaded stress test completes");
 }
 
+/* --- Step 25: Deterministic Realloc Pointer Invalidation & Edge Cases --- */
+
+static void *mock_inplace_realloc(void *ptr, size_t size) {
+    (void)size;
+    return ptr; /* Guarantees in-place reallocation (same address) */
+}
+
+static void *mock_relocating_realloc(void *ptr, size_t size) {
+    if (ptr == NULL) {
+        return malloc(size);
+    }
+    if (size == 0) {
+        free(ptr);
+        return NULL;
+    }
+    void *new_buf = malloc(size);
+    if (!new_buf) return NULL;
+    memcpy(new_buf, ptr, size < 32 ? size : 32);
+    free(ptr);
+    return new_buf; /* Guarantees memory relocation to a distinct address */
+}
+
+static void *mock_failing_realloc(void *ptr, size_t size) {
+    (void)ptr;
+    (void)size;
+    return NULL; /* Guarantees allocation failure without modifying original */
+}
+
+static char mock_zero_target_anchor;
+static void *mock_zero_nonnull_realloc(void *ptr, size_t size) {
+    if (size == 0) {
+        free(ptr);
+        return &mock_zero_target_anchor;
+    }
+    return realloc(ptr, size);
+}
+
+static void *mock_zero_null_realloc(void *ptr, size_t size) {
+    if (size == 0) {
+        free(ptr);
+        return NULL;
+    }
+    return realloc(ptr, size);
+}
+
+static void test_realloc_pointer_invalidation_and_edge_cases(void) {
+    size_t initial_count = mg_get_tracked_count();
+
+    /* -------------------------------------------------------------------------
+     * 1. Successful realloc that remains at the same address (in-place)
+     * ------------------------------------------------------------------------- */
+    {
+        void *p = malloc(64);
+        TEST_ASSERT(p != NULL, "Allocated buffer for in-place realloc test");
+        TEST_ASSERT(mg_register_external(p, 64) == 1, "Registered buffer");
+
+        uintptr_t orig_addr = (uintptr_t)p;
+        mg_test_set_realloc_fn(mock_inplace_realloc);
+
+        void *new_p = mg_realloc_external(p, 128);
+        mg_test_reset_realloc_fn();
+
+        TEST_ASSERT(new_p != NULL, "In-place realloc returned non-NULL");
+        TEST_ASSERT((uintptr_t)new_p == orig_addr, "Address preserved for in-place realloc");
+        TEST_ASSERT(mg_is_tracked(new_p) == 1, "In-place realloc pointer is tracked");
+        TEST_ASSERT(mg_get_allocation_size(new_p) == 128, "Size updated to 128");
+        TEST_ASSERT(mg_is_valid_access(new_p, 128) == 1, "Full 128-byte range valid");
+        TEST_ASSERT(mg_is_valid_access((char *)new_p + 128, 1) == 0, "Access past new size rejected");
+        TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold after in-place realloc");
+
+        TEST_ASSERT(mg_unregister_external(new_p) == 1, "Unregistered in-place realloc");
+        free(new_p);
+        TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count restored");
+    }
+
+    /* -------------------------------------------------------------------------
+     * 2. Successful realloc that relocates to a different address
+     *    and verifies old allocation address is no longer registered
+     * ------------------------------------------------------------------------- */
+    {
+        void *p = malloc(48);
+        TEST_ASSERT(p != NULL, "Allocated buffer for relocating realloc test");
+        memset(p, 0x5A, 48);
+        TEST_ASSERT(mg_register_external(p, 48) == 1, "Registered buffer");
+
+        /* Preserve old address as an integer BEFORE calling realloc */
+        uintptr_t old_addr = (uintptr_t)p;
+        mg_test_set_realloc_fn(mock_relocating_realloc);
+
+        void *new_p = mg_realloc_external(p, 256);
+        mg_test_reset_realloc_fn();
+
+        TEST_ASSERT(new_p != NULL, "Relocating realloc returned non-NULL");
+        TEST_ASSERT((uintptr_t)new_p != old_addr, "Memory was genuinely relocated to new address");
+
+        /* Old allocation address MUST NOT be tracked or accessible */
+        TEST_ASSERT(mg_is_tracked((const void *)old_addr) == 0, "Old address is no longer tracked");
+        TEST_ASSERT(mg_is_valid_access((const void *)old_addr, 1) == 0, "Access at old address rejected");
+
+        /* New allocation address MUST be tracked with updated size */
+        TEST_ASSERT(mg_is_tracked(new_p) == 1, "New address is tracked in registry");
+        TEST_ASSERT(mg_get_allocation_size(new_p) == 256, "Size updated to 256 bytes");
+        TEST_ASSERT(mg_is_valid_access(new_p, 256) == 1, "Full 256-byte range valid");
+
+        /* Interior pointer validation */
+        TEST_ASSERT(mg_is_valid_access((char *)new_p + 100, 1) == 1, "Interior access at offset 100 valid");
+        TEST_ASSERT(mg_is_valid_access((char *)new_p + 255, 1) == 1, "Interior access at last byte valid");
+        TEST_ASSERT(mg_is_valid_access((char *)new_p + 256, 1) == 0, "Access past boundary rejected");
+
+        /* Payload data preserved */
+        TEST_ASSERT(((unsigned char *)new_p)[0] == 0x5A && ((unsigned char *)new_p)[31] == 0x5A,
+                    "Payload intact in relocated block");
+        TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold after relocating realloc");
+
+        TEST_ASSERT(mg_unregister_external(new_p) == 1, "Unregistered relocated buffer");
+        free(new_p);
+        TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count restored");
+    }
+
+    /* -------------------------------------------------------------------------
+     * 3. Failed realloc preserving original allocation and registry entry
+     * ------------------------------------------------------------------------- */
+    {
+        void *p = malloc(80);
+        TEST_ASSERT(p != NULL, "Allocated buffer for failed realloc test");
+        memset(p, 0xC3, 80);
+        TEST_ASSERT(mg_register_external(p, 80) == 1, "Registered buffer");
+
+        mg_test_set_realloc_fn(mock_failing_realloc);
+        void *fail_res = mg_realloc_external(p, 512);
+        mg_test_reset_realloc_fn();
+
+        TEST_ASSERT(fail_res == NULL, "Realloc failed as expected");
+        TEST_ASSERT(mg_is_tracked(p) == 1, "Original pointer is STILL tracked after failure");
+        TEST_ASSERT(mg_get_allocation_size(p) == 80, "Original size preserved after failure");
+        TEST_ASSERT(mg_is_valid_access(p, 80) == 1, "Original bounds valid after failure");
+        TEST_ASSERT(mg_is_valid_access((char *)p + 80, 1) == 0, "Access past original bounds rejected");
+        TEST_ASSERT(((unsigned char *)p)[0] == 0xC3, "Original buffer content intact");
+        TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold after failed realloc");
+
+        TEST_ASSERT(mg_unregister_external(p) == 1, "Cleaned up failed test buffer");
+        free(p);
+        TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count restored");
+    }
+
+    /* -------------------------------------------------------------------------
+     * 4. External vs Native allocation ownership behavior (owns_payload)
+     * ------------------------------------------------------------------------- */
+    {
+        /* External: owns_payload == 0 */
+        void *ext = malloc(50);
+        TEST_ASSERT(ext != NULL, "Allocated external block");
+        TEST_ASSERT(mg_register_external(ext, 50) == 1, "Registered external block");
+
+        mg_test_set_realloc_fn(mock_relocating_realloc);
+        void *realloc_ext = mg_realloc_external(ext, 100);
+        mg_test_reset_realloc_fn();
+
+        TEST_ASSERT(realloc_ext != NULL, "External realloc succeeded");
+        /* owns_payload must remain 0: mg_unregister_external detaches without freeing payload */
+        TEST_ASSERT(mg_unregister_external(realloc_ext) == 1, "Unregistered external block");
+        free(realloc_ext);
+        TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold");
+
+        /* Native: owns_payload == 1 */
+        void *nat = mg_malloc(50);
+        TEST_ASSERT(nat != NULL, "Allocated native block");
+
+        mg_test_set_realloc_fn(mock_relocating_realloc);
+        void *realloc_nat = mg_realloc_external(nat, 100);
+        mg_test_reset_realloc_fn();
+
+        TEST_ASSERT(realloc_nat != NULL, "Native realloc succeeded");
+        /* owns_payload must remain 1: mg_free frees payload and registry entry */
+        mg_free(realloc_nat);
+        TEST_ASSERT(mg_is_tracked(realloc_nat) == 0, "Native block untracked after mg_free");
+        TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold after mg_free");
+    }
+
+    /* -------------------------------------------------------------------------
+     * 5. realloc(NULL, size) handling
+     * ------------------------------------------------------------------------- */
+    {
+        /* mg_realloc_external(NULL, size) -> untracked allocation (standard realloc) */
+        void *p1 = mg_realloc_external(NULL, 64);
+        TEST_ASSERT(p1 != NULL, "mg_realloc_external(NULL, 64) returned non-NULL");
+        TEST_ASSERT(mg_is_tracked(p1) == 0, "mg_realloc_external(NULL, size) produces untracked pointer");
+        free(p1);
+
+        /* mg_intercept_realloc(NULL, size) -> tracked allocation (like mg_intercept_malloc) */
+        void *p2 = mg_intercept_realloc(NULL, 64);
+        TEST_ASSERT(p2 != NULL, "mg_intercept_realloc(NULL, 64) returned non-NULL");
+        TEST_ASSERT(mg_is_tracked(p2) == 1, "mg_intercept_realloc(NULL, size) produces tracked pointer");
+        TEST_ASSERT(mg_get_allocation_size(p2) == 64, "Size is 64");
+        mg_intercept_free(p2);
+        TEST_ASSERT(mg_is_tracked(p2) == 0, "Untracked after mg_intercept_free");
+        TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold");
+    }
+
+    /* -------------------------------------------------------------------------
+     * 6. Zero-size realloc platform contracts
+     * ------------------------------------------------------------------------- */
+    {
+        /* Contract A: platform frees buffer and returns NULL */
+        void *p_null = mg_intercept_malloc(64);
+        TEST_ASSERT(p_null != NULL, "Allocated buffer for zero-size NULL realloc");
+        uintptr_t addr_null = (uintptr_t)p_null;
+        size_t count_before_a = mg_get_tracked_count();
+
+        mg_test_set_realloc_fn(mock_zero_null_realloc);
+        void *res_null = mg_realloc_external(p_null, 0);
+        mg_test_reset_realloc_fn();
+
+        TEST_ASSERT(res_null == NULL, "Mock zero-size realloc returned NULL");
+        TEST_ASSERT(mg_is_tracked((const void *)addr_null) == 0, "Old address unlinked after zero-size free");
+        TEST_ASSERT(mg_get_tracked_count() == count_before_a - 1, "Tracked count decremented");
+        TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold after zero-size NULL");
+
+        /* Contract B: platform returns non-NULL zero-sized pointer */
+        void *p_nonnull = mg_intercept_malloc(64);
+        TEST_ASSERT(p_nonnull != NULL, "Allocated buffer for zero-size non-NULL realloc");
+        uintptr_t addr_nonnull = (uintptr_t)p_nonnull;
+
+        mg_test_set_realloc_fn(mock_zero_nonnull_realloc);
+        void *res_nonnull = mg_realloc_external(p_nonnull, 0);
+        mg_test_reset_realloc_fn();
+
+        TEST_ASSERT(res_nonnull != NULL, "Mock zero-size realloc returned non-NULL");
+        TEST_ASSERT(mg_is_tracked((const void *)addr_nonnull) == 0, "Old address unlinked");
+        TEST_ASSERT(mg_is_tracked(res_nonnull) == 1, "New zero-size address tracked");
+        TEST_ASSERT(mg_get_allocation_size(res_nonnull) == 0, "Allocation size is 0");
+        TEST_ASSERT(mg_is_valid_access(res_nonnull, 1) == 0, "Non-zero access rejected for 0-size buffer");
+        TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold after zero-size non-NULL");
+
+        TEST_ASSERT(mg_unregister_external(res_nonnull) == 1, "Unregistered zero-size buffer");
+        TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count restored");
+    }
+
+    /* -------------------------------------------------------------------------
+     * 7. Untracked pointer pass-through
+     * ------------------------------------------------------------------------- */
+    {
+        void *raw = malloc(32);
+        TEST_ASSERT(raw != NULL, "Allocated raw buffer");
+        void *realloced = mg_realloc_external(raw, 96);
+        TEST_ASSERT(realloced != NULL, "Untracked realloc succeeded");
+        TEST_ASSERT(mg_is_tracked(realloced) == 0, "Untracked pointer remains untracked");
+        free(realloced);
+        TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold");
+    }
+
+    /* -------------------------------------------------------------------------
+     * 8. Registry node allocation failure before realloc (nonzero size)
+     * ------------------------------------------------------------------------- */
+    {
+        void *p = malloc(64);
+        TEST_ASSERT(p != NULL, "Allocated buffer for node alloc failure test");
+        memset(p, 0x77, 64);
+        TEST_ASSERT(mg_register_external(p, 64) == 1, "Registered buffer");
+        size_t count_before = mg_get_tracked_count();
+
+        /* Simulate registry node allocation failure */
+        mg_test_set_node_alloc_fail(1);
+        void *res = mg_realloc_external(p, 128);
+        mg_test_set_node_alloc_fail(0);
+
+        TEST_ASSERT(res == NULL, "mg_realloc_external returned NULL when node allocation fails");
+        TEST_ASSERT(mg_is_tracked(p) == 1, "Original allocation is STILL tracked after node alloc failure");
+        TEST_ASSERT(mg_get_allocation_size(p) == 64, "Original size preserved (64 bytes)");
+        TEST_ASSERT(mg_is_valid_access(p, 64) == 1, "Original buffer memory access valid");
+        TEST_ASSERT(mg_is_valid_access((char *)p + 64, 1) == 0, "Access past original bounds rejected");
+        TEST_ASSERT(((unsigned char *)p)[0] == 0x77, "Original buffer content unmodified");
+        TEST_ASSERT(mg_get_tracked_count() == count_before, "Tracked count unchanged after node alloc failure");
+        TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold after node alloc failure");
+
+        /* Clean up */
+        TEST_ASSERT(mg_unregister_external(p) == 1, "Unregistered buffer");
+        free(p);
+        TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count restored");
+        TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold after cleanup");
+    }
+
+    /* -------------------------------------------------------------------------
+     * 9. Registry node allocation failure before realloc (zero size)
+     * ------------------------------------------------------------------------- */
+    {
+        void *p0 = malloc(48);
+        TEST_ASSERT(p0 != NULL, "Allocated buffer for zero-size node alloc failure test");
+        memset(p0, 0x88, 48);
+        TEST_ASSERT(mg_register_external(p0, 48) == 1, "Registered buffer");
+        size_t count_before = mg_get_tracked_count();
+
+        /* Simulate node allocation failure for size == 0 */
+        mg_test_set_node_alloc_fail(1);
+        void *res0 = mg_realloc_external(p0, 0);
+        mg_test_set_node_alloc_fail(0);
+
+        TEST_ASSERT(res0 == NULL, "Zero-size realloc returned NULL on node alloc failure");
+        TEST_ASSERT(mg_is_tracked(p0) == 1, "Original allocation still tracked after zero-size node alloc failure");
+        TEST_ASSERT(mg_get_allocation_size(p0) == 48, "Original size preserved");
+        TEST_ASSERT(mg_is_valid_access(p0, 48) == 1, "Original bounds valid");
+        TEST_ASSERT(((unsigned char *)p0)[0] == 0x88, "Buffer content unmodified");
+        TEST_ASSERT(mg_get_tracked_count() == count_before, "Tracked count unchanged");
+        TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold");
+
+        /* Clean up */
+        TEST_ASSERT(mg_unregister_external(p0) == 1, "Unregistered buffer");
+        free(p0);
+        TEST_ASSERT(mg_get_tracked_count() == initial_count, "Tracked count restored");
+        TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold after cleanup");
+    }
+
+    TEST_ASSERT(mg_get_tracked_count() == initial_count, "Overall tracked count restored");
+    TEST_ASSERT(mg_verify_tree_invariants() == 1, "Tree invariants hold at test end");
+}
+
 int main(void) {
     printf("========================================\n");
     printf("  MemoryGuard Allocation Registry Tests \n");
@@ -1554,6 +1871,7 @@ int main(void) {
     RUN_TEST(test_large_scale_allocations);
     RUN_TEST(test_overlapping_external_ranges);
     RUN_TEST(test_realloc_address_relocation_stress);
+    RUN_TEST(test_realloc_pointer_invalidation_and_edge_cases);
     RUN_TEST(test_multithreaded_concurrent_tree_stress);
 
     printf("========================================\n");
