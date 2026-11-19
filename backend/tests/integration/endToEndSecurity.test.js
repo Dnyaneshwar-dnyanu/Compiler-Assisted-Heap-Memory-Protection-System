@@ -1,11 +1,19 @@
-import { describe, it } from 'node:test';
+import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import request from 'supertest';
 import EventEmitter from 'node:events';
 import app from '../../src/app.js';
 import { setCustomSpawn, resetCustomSpawn, setRunnerTestOverrides } from '../../src/services/execution/dockerRunner.js';
+import { enableCompilerTestFallback, disableCompilerTestFallback } from '../../src/services/compiler/compilerRunner.js';
 
 describe('End-to-End Security & Compiler Regression Suite', () => {
+  before(() => {
+    enableCompilerTestFallback();
+  });
+
+  after(() => {
+    disableCompilerTestFallback();
+  });
 
   // ---------------------------------------------------------------------------
   // 1. Heap Out-of-Bounds Write (C)

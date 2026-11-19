@@ -1,0 +1,50 @@
+# ==============================================================================
+# MemoryGuard Compiler Sandbox Dockerfile
+# Restricted container image for compiling and instrumenting C/C++ source code
+# ==============================================================================
+
+FROM ubuntu:24.04
+
+# Avoid interactive prompts during apt package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install only necessary compiler toolchain components (Clang 18, Opt 18, libc/libstdc++ dev)
+# Node.js, Python, Docker socket, and frontend tools are strictly omitted.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        clang-18 \
+        llvm-18 \
+        libstdc++-14-dev \
+        libc6-dev \
+        ca-certificates && \
+    ln -s /usr/bin/clang-18 /usr/local/bin/clang && \
+    ln -s /usr/bin/clang++-18 /usr/local/bin/clang++ && \
+    ln -s /usr/bin/opt-18 /usr/local/bin/opt && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create unprivileged non-root user and group (UID/GID: 10001)
+RUN groupadd -g 10001 mgcompiler && \
+    useradd -u 10001 -g mgcompiler -s /bin/false -M -d /nonexistent mgcompiler
+
+# Create MemoryGuard directory structure
+WORKDIR /opt/memoryguard
+RUN mkdir -p /opt/memoryguard/lib /opt/memoryguard/include /opt/memoryguard/bin /src /out
+
+# Copy the built compiler pass plugin, runtime library, and headers
+COPY build/compiler/MemoryGuardPass.so /opt/memoryguard/lib/MemoryGuardPass.so
+COPY build/libmemoryguard.a /opt/memoryguard/lib/libmemoryguard.a
+COPY runtime/include/memoryguard.h /opt/memoryguard/include/memoryguard.h
+
+# Copy the container compilation pipeline runner script
+COPY docker/compile_runner.sh /opt/memoryguard/bin/mg-compile
+
+# Set permissions
+RUN chmod 755 /opt/memoryguard/bin/mg-compile && \
+    chmod 644 /opt/memoryguard/lib/MemoryGuardPass.so /opt/memoryguard/lib/libmemoryguard.a /opt/memoryguard/include/memoryguard.h && \
+    chown -R mgcompiler:mgcompiler /opt/memoryguard /out
+
+# Switch to dedicated unprivileged non-root user
+USER 10001:10001
+
+# Entrypoint executes the pipeline runner
+ENTRYPOINT ["/opt/memoryguard/bin/mg-compile"]

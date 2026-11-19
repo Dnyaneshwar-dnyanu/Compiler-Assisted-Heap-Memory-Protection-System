@@ -137,6 +137,13 @@ describe('App Integration', () => {
     // Verify Analysis Dashboard shows inserted checks
     expect(screen.getByText('Checks Inserted')).toBeInTheDocument();
     expect(screen.getAllByText('2').length).toBeGreaterThanOrEqual(1);
+
+    // Edit the source code in editor textarea
+    const textarea = screen.getByTestId('code-editor-textarea');
+    fireEvent.change(textarea, { target: { value: '#include <stdlib.h>\nint main() { return 1; }' } });
+
+    // Run button must be invalidated and disabled!
+    expect(runBtn).toBeDisabled();
   });
 
   it('disables Run button and shows compiler diagnostics when compilation fails', async () => {

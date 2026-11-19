@@ -3,7 +3,9 @@
 # Minimal Linux runtime image for executing MemoryGuard instrumented binaries
 # ==============================================================================
 
-FROM debian:bookworm-slim
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
 
 # Install only the runtime shared libraries needed for C and C++ executions
 # (glibc, libstdc++6, libgcc_s).

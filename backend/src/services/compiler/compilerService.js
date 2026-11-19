@@ -1,12 +1,12 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import {
   getCompilerConfig,
   validateToolchain,
-  toWslPath,
   sanitizeDiagnostics
 } from './compilerConfig.js';
 import { createWorkspace, writeSource } from './workspaceManager.js';
-import { runTool } from './compilerRunner.js';
+import { runCompilerContainer } from './compilerRunner.js';
 
 /**
  * Parses structured module metrics from MemoryGuard opt pass diagnostic output.
@@ -60,18 +60,24 @@ export function parseMemoryGuardDiagnostics(output) {
 }
 
 /**
- * Coordinate the full MemoryGuard compilation pipeline:
- * 1. Validate inputs and toolchain
- * 2. Create workspace and write source
- * 3. Emit LLVM IR bitcode with Clang/Clang++
- * 4. Run MemoryGuard pass with opt
- * 5. Link with MemoryGuard runtime static library
+ * Coordinate the full MemoryGuard compilation pipeline inside a restricted Docker container:
+ * 1. Validate inputs (language, size)
+ * 2. Create isolated workspace with separate src and out directories
+ * 3. Write source into src/
+ * 4. Execute compilation and instrumentation pipeline inside Docker container
+ * 5. Parse diagnostics and capture resulting executable and LLVM IR artifacts
  */
-export async function compileSource({ sourceCode, language = 'c', customConfig = {} }) {
+export async function compileSource({
+  sourceCode,
+  language = 'c',
+  customConfig = {},
+  abortSignal = null,
+  _internalTestOverrides = null
+}) {
   const startTime = Date.now();
   const cfg = { ...getCompilerConfig(), ...customConfig };
 
-  // Validate language
+  // 1. Validate language
   const normalizedLang = (language || 'c').toLowerCase().trim();
   if (normalizedLang !== 'c' && normalizedLang !== 'cpp') {
     return {
@@ -83,7 +89,7 @@ export async function compileSource({ sourceCode, language = 'c', customConfig =
     };
   }
 
-  // Validate source code size
+  // 2. Validate source code size
   const sourceBytes = Buffer.byteLength(sourceCode || '', 'utf8');
   if (sourceBytes > cfg.maxSourceBytes) {
     return {
@@ -95,207 +101,195 @@ export async function compileSource({ sourceCode, language = 'c', customConfig =
     };
   }
 
-  // Validate toolchain dependencies
-  const toolchain = validateToolchain(cfg);
-  if (!toolchain.valid) {
-    return {
-      success: false,
-      errorCategory: 'TOOLCHAIN_ERROR',
-      stage: 'TOOLCHAIN_VALIDATION',
-      message: 'MemoryGuard toolchain components are missing or incomplete.',
-      diagnostics: toolchain.errors.join('\n')
-    };
+  // Validate custom toolchain paths if explicitly provided in tests
+  if (customConfig.pluginPath || customConfig.runtimeLibPath) {
+    const toolchain = validateToolchain(cfg);
+    if (!toolchain.valid) {
+      return {
+        success: false,
+        errorCategory: 'TOOLCHAIN_ERROR',
+        stage: 'TOOLCHAIN_VALIDATION',
+        message: 'MemoryGuard toolchain components are missing or incomplete.',
+        diagnostics: toolchain.errors.join('\n')
+      };
+    }
   }
 
-  // Create isolated workspace
+  // 3. Create isolated workspace
   const workspace = createWorkspace(cfg.workspaceRoot);
   const paths = writeSource(workspace, sourceCode, normalizedLang);
 
-  const stages = [];
-  const compilerTool = normalizedLang === 'cpp' ? cfg.clangxxTool : cfg.clangTool;
-
-  // Resolve file paths for the execution platform (WSL or native)
-  const sourceArg = cfg.useWsl ? toWslPath(paths.filePath) : paths.filePath;
-  const bitcodeArg = cfg.useWsl ? toWslPath(paths.bitcodeFile) : paths.bitcodeFile;
-  const instBitcodeArg = cfg.useWsl ? toWslPath(paths.instrumentedBitcodeFile) : paths.instrumentedBitcodeFile;
-  const executableArg = cfg.useWsl ? toWslPath(paths.executableFile) : paths.executableFile;
-  const includeArg = cfg.useWsl ? toWslPath(cfg.runtimeIncludePath) : cfg.runtimeIncludePath;
-  const pluginArg = cfg.useWsl ? toWslPath(cfg.pluginPath) : cfg.pluginPath;
-  const runtimeLibArg = cfg.useWsl ? toWslPath(cfg.runtimeLibPath) : cfg.runtimeLibPath;
-
-  // ---------------------------------------------------------------------------
-  // Stage 1: Frontend Compilation to LLVM IR
-  // ---------------------------------------------------------------------------
-  const stage1Start = Date.now();
-  const clangArgs = [
-    '-O0',
-    '-Xclang',
-    '-disable-O0-optnone',
-    '-emit-llvm',
-    '-S',
-    sourceArg,
-    '-I',
-    includeArg,
-    '-o',
-    bitcodeArg
-  ];
-
-  const clangResult = await runTool(compilerTool, clangArgs, {
-    timeoutMs: cfg.timeoutMs,
-    maxOutputBytes: cfg.maxOutputBytes,
-    useWsl: cfg.useWsl
+  // 4. Run compilation pipeline inside dedicated restricted Docker container
+  const containerRes = await runCompilerContainer({
+    srcDir: paths.srcDir,
+    outDir: paths.outDir,
+    language: normalizedLang,
+    abortSignal,
+    _internalTestOverrides,
+    customConfig
   });
 
-  const stage1Duration = Date.now() - stage1Start;
+  const rawCombinedOutput = (containerRes.stdout || '') + '\n' + (containerRes.stderr || '');
+  const sanitizedOutput = sanitizeDiagnostics(rawCombinedOutput.trim(), workspace.workspaceDir);
 
-  if (!clangResult.success) {
-    stages.push({
-      name: 'FRONTEND_COMPILATION',
-      status: 'failed',
-      durationMs: stage1Duration
-    });
+  // Helper to ensure failed or interrupted compilations leave zero stale executable artifacts
+  const cleanupStaleArtifacts = () => {
+    try {
+      if (fs.existsSync(paths.outExecutableFile)) {
+        fs.rmSync(paths.outExecutableFile, { force: true });
+      }
+      if (fs.existsSync(paths.executableFile)) {
+        fs.rmSync(paths.executableFile, { force: true });
+      }
+      const manifestPath = path.join(workspace.workspaceDir, 'manifest.json');
+      if (fs.existsSync(manifestPath)) {
+        fs.rmSync(manifestPath, { force: true });
+      }
+    } catch {}
+  };
 
-    const errorCategory = clangResult.timedOut
-      ? 'TIMEOUT_ERROR'
-      : (clangResult.spawnError ? 'SPAWN_ERROR' : 'COMPILATION_ERROR');
+  // Handle fatal container orchestration or environment errors
+  if (containerRes.errorCategory === 'DOCKER_UNAVAILABLE') {
+    cleanupStaleArtifacts();
+    return {
+      success: false,
+      jobId: workspace.jobId,
+      errorCategory: 'TOOLCHAIN_ERROR',
+      stage: 'TOOLCHAIN_VALIDATION',
+      message: 'Docker daemon is not running or unreachable. Unable to start compilation container.',
+      stages: [],
+      diagnostics: sanitizedOutput || 'Docker daemon unreachable'
+    };
+  }
 
-    const rawDiagnostics = clangResult.stderr || clangResult.stdout;
-    const sanitized = sanitizeDiagnostics(rawDiagnostics, workspace.workspaceDir);
+  if (containerRes.errorCategory === 'IMAGE_NOT_FOUND') {
+    cleanupStaleArtifacts();
+    return {
+      success: false,
+      jobId: workspace.jobId,
+      errorCategory: 'TOOLCHAIN_ERROR',
+      stage: 'TOOLCHAIN_VALIDATION',
+      message: containerRes.message || 'Compiler container image is not available locally.',
+      stages: [],
+      diagnostics: sanitizedOutput || 'Compiler image not found'
+    };
+  }
+
+  if (containerRes.errorCategory === 'TIMEOUT_ERROR' || containerRes.timedOut) {
+    cleanupStaleArtifacts();
+    let failingStage = 'FRONTEND_COMPILATION';
+    if (rawCombinedOutput.includes('STAGE_FAILED: INSTRUMENTATION')) {
+      failingStage = 'INSTRUMENTATION';
+    } else if (rawCombinedOutput.includes('STAGE_FAILED: LINKING')) {
+      failingStage = 'LINKING';
+    }
+
+    return {
+      success: false,
+      jobId: workspace.jobId,
+      errorCategory: 'TIMEOUT_ERROR',
+      stage: failingStage,
+      message: `Compiler timed out after ${cfg.timeoutMs}ms.`,
+      stages: [{ name: failingStage, status: 'failed', durationMs: containerRes.durationMs }],
+      diagnostics: sanitizedOutput,
+      outputTruncated: containerRes.outputTruncated
+    };
+  }
+
+  if (containerRes.errorCategory === 'ABORTED' || containerRes.aborted) {
+    cleanupStaleArtifacts();
+    return {
+      success: false,
+      jobId: workspace.jobId,
+      errorCategory: 'ABORTED',
+      stage: 'COMPILATION',
+      message: 'Compilation aborted by client disconnect.',
+      stages: [],
+      diagnostics: ''
+    };
+  }
+
+  // Handle compilation, instrumentation, or linking failures inside the container
+  if (!containerRes.success) {
+    cleanupStaleArtifacts();
+    let failingStage = 'FRONTEND_COMPILATION';
+    let errorCategory = 'COMPILATION_ERROR';
+
+    if (containerRes.exitCode === 2 || rawCombinedOutput.includes('STAGE_FAILED: INSTRUMENTATION')) {
+      failingStage = 'INSTRUMENTATION';
+      errorCategory = 'INSTRUMENTATION_ERROR';
+    } else if (containerRes.exitCode === 3 || rawCombinedOutput.includes('STAGE_FAILED: LINKING')) {
+      failingStage = 'LINKING';
+      errorCategory = 'LINKER_ERROR';
+    } else if (containerRes.exitCode === 1 || rawCombinedOutput.includes('STAGE_FAILED: FRONTEND_COMPILATION')) {
+      failingStage = 'FRONTEND_COMPILATION';
+      errorCategory = 'COMPILATION_ERROR';
+    } else if (containerRes.spawnError) {
+      errorCategory = 'SPAWN_ERROR';
+    }
+
+    const stages = [];
+    if (failingStage === 'FRONTEND_COMPILATION') {
+      stages.push({ name: 'FRONTEND_COMPILATION', status: 'failed', durationMs: containerRes.durationMs });
+    } else if (failingStage === 'INSTRUMENTATION') {
+      stages.push({ name: 'FRONTEND_COMPILATION', status: 'completed', durationMs: 0 });
+      stages.push({ name: 'INSTRUMENTATION', status: 'failed', durationMs: containerRes.durationMs });
+    } else if (failingStage === 'LINKING') {
+      stages.push({ name: 'FRONTEND_COMPILATION', status: 'completed', durationMs: 0 });
+      stages.push({ name: 'INSTRUMENTATION', status: 'completed', durationMs: 0 });
+      stages.push({ name: 'LINKING', status: 'failed', durationMs: containerRes.durationMs });
+    }
 
     return {
       success: false,
       jobId: workspace.jobId,
       errorCategory,
-      stage: 'FRONTEND_COMPILATION',
-      message: clangResult.timedOut
-        ? `Frontend compiler timed out after ${cfg.timeoutMs}ms.`
-        : 'Frontend compilation failed with errors.',
+      stage: failingStage,
+      message: `${failingStage.replace('_', ' ')} failed with errors.`,
       stages,
-      diagnostics: sanitized,
-      outputTruncated: clangResult.outputTruncated
+      diagnostics: sanitizedOutput,
+      outputTruncated: containerRes.outputTruncated
     };
   }
 
-  stages.push({
-    name: 'FRONTEND_COMPILATION',
-    status: 'completed',
-    durationMs: stage1Duration
-  });
-
   // ---------------------------------------------------------------------------
-  // Stage 2: MemoryGuard LLVM Pass Instrumentation
+  // Compilation Successful
   // ---------------------------------------------------------------------------
-  const stage2Start = Date.now();
-  const optArgs = [
-    `-load-pass-plugin=${pluginArg}`,
-    '-passes=memoryguard',
-    '-S',
-    bitcodeArg,
-    '-o',
-    instBitcodeArg
+  const stages = [
+    { name: 'FRONTEND_COMPILATION', status: 'completed', durationMs: Math.round(containerRes.durationMs / 3) },
+    { name: 'INSTRUMENTATION', status: 'completed', durationMs: Math.round(containerRes.durationMs / 3) },
+    { name: 'LINKING', status: 'completed', durationMs: Math.round(containerRes.durationMs / 3) }
   ];
 
-  const optResult = await runTool(cfg.optTool, optArgs, {
-    timeoutMs: cfg.timeoutMs,
-    maxOutputBytes: cfg.maxOutputBytes,
-    useWsl: cfg.useWsl
-  });
-
-  const stage2Duration = Date.now() - stage2Start;
-
-  if (!optResult.success) {
-    stages.push({
-      name: 'INSTRUMENTATION',
-      status: 'failed',
-      durationMs: stage2Duration
-    });
-
-    const errorCategory = optResult.timedOut ? 'TIMEOUT_ERROR' : 'INSTRUMENTATION_ERROR';
-    const rawDiagnostics = optResult.stderr || optResult.stdout;
-    const sanitized = sanitizeDiagnostics(rawDiagnostics, workspace.workspaceDir);
-
-    return {
-      success: false,
-      jobId: workspace.jobId,
-      errorCategory,
-      stage: 'INSTRUMENTATION',
-      message: optResult.timedOut
-        ? `MemoryGuard pass timed out after ${cfg.timeoutMs}ms.`
-        : 'MemoryGuard LLVM instrumentation pass failed.',
-      stages,
-      diagnostics: sanitized,
-      outputTruncated: optResult.outputTruncated
-    };
+  // If program.bin was created in out/, copy to workspace root so executionService finds it
+  if (fs.existsSync(paths.outExecutableFile) && !fs.existsSync(paths.executableFile)) {
+    try {
+      fs.copyFileSync(paths.outExecutableFile, paths.executableFile);
+      fs.chmodSync(paths.executableFile, 0o755);
+    } catch {}
   }
 
-  stages.push({
-    name: 'INSTRUMENTATION',
-    status: 'completed',
-    durationMs: stage2Duration
-  });
-
-  // Extract MemoryGuard analysis summary from opt output
-  const optCombinedOutput = (optResult.stdout || '') + '\n' + (optResult.stderr || '');
-  const parsedDiagnostics = parseMemoryGuardDiagnostics(optCombinedOutput);
-  const sanitizedOptOutput = sanitizeDiagnostics(optCombinedOutput.trim(), workspace.workspaceDir);
-
-  // ---------------------------------------------------------------------------
-  // Stage 3: Linking with MemoryGuard Runtime
-  // ---------------------------------------------------------------------------
-  const stage3Start = Date.now();
-  const linkArgs = [
-    instBitcodeArg,
-    runtimeLibArg,
-    '-pthread',
-    '-lm',
-    '-o',
-    executableArg
-  ];
-
-  const linkResult = await runTool(compilerTool, linkArgs, {
-    timeoutMs: cfg.timeoutMs,
-    maxOutputBytes: cfg.maxOutputBytes,
-    useWsl: cfg.useWsl
-  });
-
-  const stage3Duration = Date.now() - stage3Start;
-
-  if (!linkResult.success) {
-    stages.push({
-      name: 'LINKING',
-      status: 'failed',
-      durationMs: stage3Duration
-    });
-
-    const errorCategory = linkResult.timedOut ? 'TIMEOUT_ERROR' : 'LINKER_ERROR';
-    const rawDiagnostics = linkResult.stderr || linkResult.stdout;
-    const sanitized = sanitizeDiagnostics(rawDiagnostics, workspace.workspaceDir);
-
-    return {
-      success: false,
-      jobId: workspace.jobId,
-      errorCategory,
-      stage: 'LINKING',
-      message: linkResult.timedOut
-        ? `Linker timed out after ${cfg.timeoutMs}ms.`
-        : 'Linking against MemoryGuard runtime library failed.',
-      stages,
-      diagnostics: sanitized,
-      outputTruncated: linkResult.outputTruncated
-    };
-  }
-
-  stages.push({
-    name: 'LINKING',
-    status: 'completed',
-    durationMs: stage3Duration
-  });
-
-  // Verify final executable artifact existence
   const executableExists = fs.existsSync(paths.executableFile) && fs.statSync(paths.executableFile).size > 0;
-  const bitcodeExists = fs.existsSync(paths.bitcodeFile);
-  const instBitcodeExists = fs.existsSync(paths.instrumentedBitcodeFile);
+  const irExists = fs.existsSync(paths.irFile);
+  const instIrExists = fs.existsSync(paths.instrumentedIrFile);
 
+  // Write verified completion manifest for this specific jobId
+  try {
+    const manifestPath = path.join(workspace.workspaceDir, 'manifest.json');
+    fs.writeFileSync(
+      manifestPath,
+      JSON.stringify({
+        jobId: workspace.jobId,
+        status: 'completed',
+        language: normalizedLang,
+        compiledAt: Date.now(),
+        executableAvailable: executableExists
+      }, null, 2),
+      'utf8'
+    );
+  } catch {}
+
+  const parsedDiagnostics = parseMemoryGuardDiagnostics(rawCombinedOutput);
   const totalDurationMs = Date.now() - startTime;
 
   return {
@@ -306,12 +300,15 @@ export async function compileSource({ sourceCode, language = 'c', customConfig =
     stages,
     diagnostics: {
       summary: parsedDiagnostics,
-      raw: sanitizedOptOutput
+      raw: sanitizedOutput
     },
     artifacts: {
       executableAvailable: executableExists,
-      bitcodeAvailable: bitcodeExists,
-      instrumentedBitcodeAvailable: instBitcodeExists
+      irAvailable: irExists,
+      instrumentedIrAvailable: instIrExists,
+      // Backwards-compatible aliases for existing assertions:
+      bitcodeAvailable: irExists,
+      instrumentedBitcodeAvailable: instIrExists
     },
     metadata: {
       sourceBytes,

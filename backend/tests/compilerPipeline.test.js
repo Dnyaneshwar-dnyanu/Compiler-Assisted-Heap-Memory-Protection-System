@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -17,9 +17,20 @@ import {
   cleanupWorkspace,
   cleanupExpiredWorkspaces
 } from '../src/services/compiler/workspaceManager.js';
-import { runTool } from '../src/services/compiler/compilerRunner.js';
+import {
+  runTool,
+  enableCompilerTestFallback,
+  disableCompilerTestFallback
+} from '../src/services/compiler/compilerRunner.js';
 
 describe('Compiler Toolchain Configuration & Diagnostics', () => {
+  before(() => {
+    enableCompilerTestFallback();
+  });
+
+  after(() => {
+    disableCompilerTestFallback();
+  });
   it('should detect missing pass plugin or runtime library in toolchain validation', () => {
     const invalidConfig = {
       ...getCompilerConfig(),
@@ -53,7 +64,8 @@ describe('Compiler Toolchain Configuration & Diagnostics', () => {
       sourceCode: 'int main() { return 0; }',
       language: 'c',
       customConfig: {
-        clangTool: 'nonexistent-clang-binary-12345'
+        clangTool: 'nonexistent-clang-binary-12345',
+        dockerBin: 'nonexistent-docker-binary-12345'
       }
     });
 

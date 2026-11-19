@@ -1,9 +1,18 @@
-import { describe, it } from 'node:test';
+import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import request from 'supertest';
 import app from '../src/app.js';
+import { enableCompilerTestFallback, disableCompilerTestFallback } from '../src/services/compiler/compilerRunner.js';
 
 describe('POST /api/compile (LLVM Toolchain Pipeline)', () => {
+  before(() => {
+    enableCompilerTestFallback();
+  });
+
+  after(() => {
+    disableCompilerTestFallback();
+  });
+
   it('should compile valid C source with MemoryGuard instrumentation and linking', async () => {
     const validPayload = {
       sourceCode: `

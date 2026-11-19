@@ -39,18 +39,34 @@ export default function App() {
   // Active result tab: 'output' | 'analysis' | 'diagnostics'
   const [activeTab, setActiveTab] = useState('output');
 
+  // Invalidate any active compilation and execution results when code or language changes
+  const invalidateCompilationState = useCallback(() => {
+    setCompileResult(null);
+    setCompileError(null);
+    setExecutionResult(null);
+    setExecutionError(null);
+  }, []);
+
   // Code change handler
   const handleCodeChange = useCallback((newCode) => {
-    setCodeBuffers((prev) => ({
-      ...prev,
-      [language]: newCode
-    }));
-  }, [language]);
+    setCodeBuffers((prev) => {
+      if (prev[language] === newCode) return prev;
+      return {
+        ...prev,
+        [language]: newCode
+      };
+    });
+    // Invalidate previous compilation so modified code must be recompiled before running
+    invalidateCompilationState();
+  }, [language, invalidateCompilationState]);
 
   // Language switch handler
   const handleLanguageChange = useCallback((newLang) => {
-    setLanguage(newLang);
-  }, []);
+    if (newLang !== language) {
+      setLanguage(newLang);
+      invalidateCompilationState();
+    }
+  }, [language, invalidateCompilationState]);
 
   // Reset editor to default sample
   const handleResetCode = useCallback(() => {
@@ -59,7 +75,8 @@ export default function App() {
       ...prev,
       [language]: defaultSample.code
     }));
-  }, [language]);
+    invalidateCompilationState();
+  }, [language, invalidateCompilationState]);
 
   // Choose a specific sample program
   const handleSelectSample = useCallback((sampleId) => {
@@ -70,15 +87,18 @@ export default function App() {
         ...prev,
         [language]: found.code
       }));
+      invalidateCompilationState();
     }
-  }, [language]);
+  }, [language, invalidateCompilationState]);
 
   // Can the program be run?
   const hasJob = Boolean(compileResult?.jobId);
   const canRun = Boolean(
     compileResult?.jobId &&
     compileResult?.artifacts?.executableAvailable &&
-    !compileError
+    !compileError &&
+    !isCompiling &&
+    !isRunning
   );
 
   // Handle Compile & Analyze
@@ -86,6 +106,8 @@ export default function App() {
     if (isCompiling || isRunning) return;
 
     setIsCompiling(true);
+    // Invalidate previous compilation result immediately so failed runs cannot execute older binaries
+    setCompileResult(null);
     setCompileError(null);
     setExecutionResult(null);
     setExecutionError(null);

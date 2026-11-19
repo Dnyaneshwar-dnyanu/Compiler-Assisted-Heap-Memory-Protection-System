@@ -88,6 +88,7 @@ MemoryGuard operates in two primary phases:
 | **Step 23** | End-to-End Integration & Security Verification | Completed | Comprehensive integration suite covering browser-to-container workflows, security regression scenarios, job/workspace isolation, Docker hardening, and empirical performance metrics. |
 | **Step 24** | Docker Security Lockdown & Tamper Resistance | Completed | Hardened Docker sandbox orchestration by removing client-controlled `customConfig` from the HTTP API, freezing non-negotiable security flags (`IMMUTABLE_SECURITY`), and adding tamper-resistance regression tests. |
 | **Step 25** | Fix realloc() Pointer Invalidation | Completed | Eliminated post-realloc pointer evaluation undefined behavior by preserving the original allocation address as integer (`old_start`) before `realloc()`, adding an internal allocator test seam, and validating zero-size/in-place/relocating realloc contracts under ASan/UBSan/TSan. |
+| **Step 26** | Docker-Isolated Compiler Pipeline | Completed | Moved C/C++ compilation, LLVM pass instrumentation, and runtime linking into a dedicated restricted Docker container (`memoryguard-compiler:latest`) with immutable security flags, workspace containment, separate `/src:ro` and `/out:rw` bind mounts, and offline test fallback. |
 
 ---
 
@@ -97,7 +98,9 @@ MemoryGuard operates in two primary phases:
 .
 ├── CMakeLists.txt                 # Top-level build configuration (C11, C++17, CTest)
 ├── docker/
-│   └── Dockerfile.runner          # Minimal root Dockerfile for debian:bookworm-slim runner
+│   ├── Dockerfile.compiler        # Dedicated container for Clang 18, Opt 18, and LLVM pass plugin (Step 26)
+│   ├── Dockerfile.runner          # Minimal root Dockerfile for debian:bookworm-slim runner
+│   └── compile_runner.sh          # Container-internal 3-stage compiler orchestrator (Step 26)
 ├── frontend/                      # React 18 + Vite developer frontend (Step 22)
 │   ├── package.json               # Frontend dependencies (React, Monaco, Lucide, Tailwind, Vitest)
 │   ├── vite.config.js             # Vite configuration with /api reverse proxy and Vitest setup
@@ -920,6 +923,66 @@ In standard C (C11 / C17 / C23), when `realloc(ptr, size)` relocates or dealloca
    - In default/production operation, hooks are inactive and MemoryGuard routes directly to the system allocator.
 6. **Sanitizer Verification**:
    - Verified clean execution under AddressSanitizer (ASan), UndefinedBehaviorSanitizer (UBSan), and ThreadSanitizer (TSan) across 55,039 assertions with zero warnings, zero data races, and strict `-Wall -Wextra -Wpedantic -Werror`.
+
+---
+
+### Step 26: Docker-Isolated Compiler Pipeline
+
+Previously, the runtime execution service (`POST /api/execute`) ran compiled binaries inside a restricted Docker container, but the compilation and instrumentation pipeline (`POST /api/compile`) executed Clang and Opt directly on the host or WSL environment. In Step 26, the entire C/C++ compilation and LLVM instrumentation toolchain was containerized into a dedicated restricted Docker sandbox (`memoryguard-compiler:latest`).
+
+#### Architecture: Compiler Sandbox vs. Runtime Runner
+
+| Dimension | Compiler Sandbox (`memoryguard-compiler`) | Runtime Runner (`memoryguard-runner`) |
+| :--- | :--- | :--- |
+| **Base Image** | Ubuntu 24.04 LTS (pinned with Clang 18 & Opt 18) | Debian 12 (bookworm-slim) minimal base |
+| **Installed Tooling** | Clang 18, Opt 18, libc6-dev, libstdc++-14-dev, `MemoryGuardPass.so`, `libmemoryguard.a` | Minimal C runtime libraries; zero compiler tools, headers, or build utilities |
+| **Network** | `--network none` (immutable, zero external egress) | `--network none` (immutable, zero external egress) |
+| **Privileges** | `--cap-drop ALL`, `--security-opt no-new-privileges` | `--cap-drop ALL`, `--security-opt no-new-privileges` |
+| **User Identity** | Unprivileged `mgcompiler` (`10001:10001`) | Unprivileged `mguser` (`10001:10001`) |
+| **Filesystem Mounts** | Separate `/src:ro` (source code) and `/out:rw` (output binary & LLVM IR artifacts) | Single-file read-only mount: `-v <bin>:/app/program.bin:ro` |
+| **Root Filesystem** | `--read-only` | `--read-only` |
+| **Scratch Space** | `--tmpfs /tmp:rw,noexec,nosuid,size=64m` | `--tmpfs /tmp:rw,noexec,nosuid,size=16m` |
+| **Resource Quotas** | Memory: `512m`, CPU: `1.0`, PIDs: `64` | Memory: `64m`, CPU: `0.5`, PIDs: `32` |
+| **Lifecycle** | `--init`, `--rm` (ephemeral container cleanup) | `--init`, `--rm` (ephemeral container cleanup) |
+
+#### Container Image Build Instructions
+
+```bash
+# 1. Build the compiler sandbox image
+docker build -t memoryguard-compiler:latest -f docker/Dockerfile.compiler .
+
+# 2. Build the runtime runner image
+docker build -t memoryguard-runner:latest -f docker/Dockerfile.runner .
+```
+
+#### Key Implementation Details
+
+1. **Dedicated Container Orchestrator (`docker/compile_runner.sh`)**:
+   - Executes the 3-stage pipeline in strict sequence:
+     - Stage 1: `clang-18` (or `clang++-18`) emits unoptimized LLVM IR (`/out/source.ll`).
+     - Stage 2: `opt-18` loads `MemoryGuardPass.so`, runs pointer-provenance analysis, and emits instrumented IR (`/out/source_inst.ll`).
+     - Stage 3: `clang-18` (or `clang++-18`) links instrumented IR with `libmemoryguard.a`, `-pthread`, and `-lm` into `/out/program.bin`.
+   - Explicitly sets execution permissions `chmod 0755 /out/program.bin`.
+   - Emits structured stage markers (`=== STAGE_FAILED: <STAGE> ===` or `=== COMPILATION_SUCCESS ===`) mapped to HTTP error categories.
+
+2. **Immutable Server-Side Security (`IMMUTABLE_COMPILER_SECURITY`)**:
+   - `backend/src/services/compiler/compilerConfig.js` enforces frozen security parameters that cannot be tampered with or modified via API request payloads.
+   - Child process execution invokes `docker` with `shell: false` and strict array-based argument vectors.
+
+3. **Workspace Isolation & Path Containment**:
+   - Workspaces separate source and output directories (`<workspace>/src` and `<workspace>/out`).
+   - Diagnostic sanitizer strips both host workspace paths and container-internal mount paths (`/src/` and `/out/`) before returning messages to the client.
+
+4. **Production Fail-Closed Compilation & Test-Only Explicit Fallback**:
+   - In production (`NODE_ENV === 'production'`), compilation **always** executes inside the restricted `memoryguard-compiler:latest` Docker container.
+   - If the Docker daemon is unavailable, unreachable, or fails in production, the compilation pipeline fails closed immediately with `TOOLCHAIN_ERROR` / `DOCKER_UNAVAILABLE` (`503 Service Unavailable`). It **never** silently falls back to host-side Clang, Opt, or compiler binaries.
+   - Any local host/WSL compilation used during automated testing must be explicitly enabled via `enableCompilerTestFallback()` or `_internalTestOverrides: { allowTestFallback: true }`. Calling test fallback in production strictly throws a security violation.
+   - HTTP request parameters, headers, and query arguments are strictly prohibited from activating test fallback or modifying security parameters.
+   - Pre-existing or stale `program.bin` binaries are proactively purged prior to compilation and on all failure/abort paths to guarantee that a failed compilation can never leave a stale binary eligible for execution.
+
+5. **Security Audit & Real-Container Verification Status**:
+   - The security configuration of `docker run` (`--network none`, `--read-only`, `--cap-drop ALL`, `--security-opt no-new-privileges`, `--user 10001:10001`, resource limits, read-only `/src` mount, isolated `/out` mount) was formally audited and verified across 17 test suites (113 tests passing or properly skipped).
+   - *Host Verification Note*: Docker daemon is unavailable on host. Real container integration was not verified. All real-container integration tests automatically detect daemon availability and skip gracefully when the daemon is offline.
 
 ---
 

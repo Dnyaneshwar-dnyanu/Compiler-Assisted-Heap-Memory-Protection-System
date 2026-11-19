@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import request from 'supertest';
 import fs from 'node:fs';
@@ -8,8 +8,16 @@ import app from '../../src/app.js';
 import { getCompilerConfig } from '../../src/services/compiler/compilerConfig.js';
 import { createWorkspace, cleanupWorkspace, cleanupExpiredWorkspaces } from '../../src/services/compiler/workspaceManager.js';
 import { setCustomSpawn, resetCustomSpawn } from '../../src/services/execution/dockerRunner.js';
+import { enableCompilerTestFallback, disableCompilerTestFallback } from '../../src/services/compiler/compilerRunner.js';
 
 describe('API and Workspace Job Isolation Suite', () => {
+  before(() => {
+    enableCompilerTestFallback();
+  });
+
+  after(() => {
+    disableCompilerTestFallback();
+  });
 
   // ---------------------------------------------------------------------------
   // 1. Invalid UUID Rejection

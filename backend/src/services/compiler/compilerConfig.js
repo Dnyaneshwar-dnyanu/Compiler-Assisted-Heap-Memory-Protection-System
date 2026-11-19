@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
+import { spawn } from 'node:child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -9,6 +10,24 @@ const __dirname = path.dirname(__filename);
 // Resolve repository root: from backend/src/services/compiler -> project root
 const REPO_ROOT = path.resolve(__dirname, '../../../../');
 const BACKEND_ROOT = path.resolve(__dirname, '../../../');
+
+/**
+ * Non-negotiable, immutable Docker security restrictions for the compiler container.
+ * These flags are strictly enforced and can NEVER be overridden by any HTTP client or request.
+ */
+export const IMMUTABLE_COMPILER_SECURITY = Object.freeze({
+  network: 'none',
+  readOnly: true,
+  capDrop: 'ALL',
+  securityOpt: 'no-new-privileges',
+  userUidGid: '10001:10001',
+  memoryLimit: '512m',
+  cpuLimit: '1.0',
+  pidsLimit: 64,
+  tmpfsMount: '/tmp:rw,noexec,nosuid,size=64m',
+  init: true,
+  rm: true
+});
 
 /**
  * Convert a Windows path (e.g. D:\path\file) to a WSL path (/mnt/d/path/file).
@@ -31,6 +50,15 @@ export function toWslPath(inputPath) {
 export function sanitizeDiagnostics(rawText, workspaceDir = '') {
   if (!rawText || typeof rawText !== 'string') return '';
   let sanitized = rawText;
+
+  // Sanitize container-internal mount prefixes
+  sanitized = sanitized
+    .replace(/\/src\/source\.(c|cpp)/g, 'source.$1')
+    .replace(/\/out\/program\.bin/g, 'program.bin')
+    .replace(/\/out\//g, '')
+    .replace(/\/src\//g, '')
+    .replace(/\/opt\/memoryguard\/include[\\/]/g, '')
+    .replace(/\/opt\/memoryguard\/lib[\\/]/g, '');
 
   if (workspaceDir) {
     const winDir = workspaceDir.replace(/\\/g, '/');
@@ -70,11 +98,26 @@ function resolveUseWsl() {
 }
 
 /**
- * Resolve compiler and toolchain paths with sensible defaults based on repository structure.
+ * Resolve compiler Docker and toolchain paths with sensible defaults.
  */
 export function getCompilerConfig() {
   const useWsl = resolveUseWsl();
 
+  // Docker Compiler Sandbox Configuration (Step 26)
+  const dockerBin = process.env.MG_COMPILER_DOCKER_BIN || process.env.MG_DOCKER_BIN || 'docker';
+  const imageName = process.env.MG_COMPILER_DOCKER_IMAGE || 'memoryguard-compiler:latest';
+  const timeoutMs = parseInt(process.env.MG_COMPILER_TIMEOUT_MS || '45000', 10);
+  const memoryLimit = process.env.MG_COMPILER_MEMORY || IMMUTABLE_COMPILER_SECURITY.memoryLimit;
+  const cpuLimit = process.env.MG_COMPILER_CPUS || IMMUTABLE_COMPILER_SECURITY.cpuLimit;
+  const pidsLimit = parseInt(process.env.MG_COMPILER_PIDS_LIMIT || String(IMMUTABLE_COMPILER_SECURITY.pidsLimit), 10);
+  const userUidGid = process.env.MG_COMPILER_USER || IMMUTABLE_COMPILER_SECURITY.userUidGid;
+  const tmpfsMount = process.env.MG_COMPILER_TMPFS || IMMUTABLE_COMPILER_SECURITY.tmpfsMount;
+
+  // Resource limits
+  const maxSourceBytes = parseInt(process.env.MG_MAX_SOURCE_BYTES || '524288', 10); // 512 KB
+  const maxOutputBytes = parseInt(process.env.MG_MAX_OUTPUT_BYTES || '262144', 10); // 256 KB
+
+  // Legacy/Host tool definitions for fallback and testing
   const clangTool = process.env.MG_CLANG || 'clang-18';
   const clangxxTool = process.env.MG_CLANGXX || 'clang++-18';
   const optTool = process.env.MG_OPT || 'opt-18';
@@ -99,12 +142,16 @@ export function getCompilerConfig() {
     ? path.resolve(BACKEND_ROOT, process.env.MG_WORKSPACE_ROOT)
     : path.resolve(BACKEND_ROOT, '.workspaces');
 
-  const timeoutMs = parseInt(process.env.MG_COMPILER_TIMEOUT_MS || '15000', 10);
-  const maxSourceBytes = parseInt(process.env.MG_MAX_SOURCE_BYTES || '524288', 10); // 512 KB
-  const maxOutputBytes = parseInt(process.env.MG_MAX_OUTPUT_BYTES || '262144', 10); // 256 KB
-
   return {
     useWsl,
+    dockerBin,
+    imageName,
+    timeoutMs,
+    memoryLimit,
+    cpuLimit,
+    pidsLimit,
+    userUidGid,
+    tmpfsMount,
     clangTool,
     clangxxTool,
     optTool,
@@ -112,11 +159,73 @@ export function getCompilerConfig() {
     runtimeLibPath,
     runtimeIncludePath,
     workspaceRoot,
-    timeoutMs,
     maxSourceBytes,
     maxOutputBytes,
     repoRoot: REPO_ROOT
   };
+}
+
+/**
+ * Verifies if the Docker CLI and daemon are reachable for the compiler.
+ * Returns { available: boolean, reason?: string, serverVersion?: string }.
+ */
+export function checkCompilerDockerAvailability(cfg = getCompilerConfig()) {
+  return new Promise((resolve) => {
+    let output = '';
+    let child;
+
+    try {
+      child = spawn(cfg.dockerBin, ['info', '--format', '{{.ServerVersion}}'], {
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+    } catch (err) {
+      return resolve({
+        available: false,
+        reason: `Docker CLI spawn failed: ${err.message}`
+      });
+    }
+
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGTERM');
+      } catch {}
+      resolve({
+        available: false,
+        reason: 'Compiler Docker availability check timed out'
+      });
+    }, 3000);
+
+    child.stdout?.on('data', (d) => {
+      output += d.toString();
+    });
+
+    child.stderr?.on('data', (d) => {
+      output += d.toString();
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({
+        available: false,
+        reason: `Docker daemon unreachable: ${err.message}`
+      });
+    });
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve({
+          available: true,
+          serverVersion: output.trim()
+        });
+      } else {
+        resolve({
+          available: false,
+          reason: output.trim() || `Docker check exited with code ${code}`
+        });
+      }
+    });
+  });
 }
 
 /**
