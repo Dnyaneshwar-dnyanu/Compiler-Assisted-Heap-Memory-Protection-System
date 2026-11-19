@@ -8,7 +8,7 @@ export function getExecutionConfig() {
   return {
     dockerBin: process.env.MG_DOCKER_BIN || 'docker',
     imageName: process.env.MG_DOCKER_IMAGE || 'memoryguard-runner:latest',
-    executionTimeoutMs: parseInt(process.env.MG_EXECUTION_TIMEOUT_MS || '5000', 10),
+    executionTimeoutMs: parseInt(process.env.MG_EXECUTION_TIMEOUT_MS || '10000', 10),
     memoryLimit: process.env.MG_DOCKER_MEMORY || '64m',
     cpuLimit: process.env.MG_DOCKER_CPUS || '0.5',
     pidsLimit: parseInt(process.env.MG_DOCKER_PIDS_LIMIT || '32', 10),

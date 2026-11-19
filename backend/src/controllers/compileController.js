@@ -35,7 +35,8 @@ export async function compileSource(req, res, next) {
           stage: result.stage,
           jobId: result.jobId || null,
           diagnostics: result.diagnostics || '',
-          stages: result.stages || []
+          stages: result.stages || [],
+          staticViolations: result.staticViolations || []
         }
       });
     }

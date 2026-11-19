@@ -8,7 +8,7 @@ const RAW_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 export const API_BASE_URL = RAW_BASE_URL.replace(/\/+$/, '');
 
 export class ApiError extends Error {
-  constructor(message, { code = 'UNKNOWN_ERROR', statusCode = 500, details = null, stage = null, diagnostics = '', raw = null } = {}) {
+  constructor(message, { code = 'UNKNOWN_ERROR', statusCode = 500, details = null, stage = null, diagnostics = '', staticViolations = [], raw = null } = {}) {
     super(message);
     this.name = 'ApiError';
     this.code = code;
@@ -16,6 +16,7 @@ export class ApiError extends Error {
     this.details = details;
     this.stage = stage;
     this.diagnostics = diagnostics;
+    this.staticViolations = staticViolations;
     this.raw = raw;
   }
 }
@@ -70,6 +71,7 @@ export async function apiRequest(endpoint, { method = 'GET', body = null, header
           details: errPayload.details || null,
           stage: errPayload.stage || null,
           diagnostics: errPayload.diagnostics || '',
+          staticViolations: errPayload.staticViolations || [],
           raw: json
         }
       );

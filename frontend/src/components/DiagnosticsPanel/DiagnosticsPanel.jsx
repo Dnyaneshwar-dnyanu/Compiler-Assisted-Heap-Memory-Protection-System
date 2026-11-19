@@ -1,5 +1,5 @@
 import React from 'react';
-import { Terminal, AlertTriangle, Layers, Clock, CheckCircle2, XCircle } from 'lucide-react';
+import { Terminal, AlertTriangle, Layers, Clock, CheckCircle2, XCircle, ShieldAlert } from 'lucide-react';
 import { StageBadge } from '../StatusIndicator/StageBadge.jsx';
 import { formatDuration, formatBytes } from '../../utils/formatters.js';
 
@@ -53,6 +53,68 @@ export function DiagnosticsPanel({ compileResult, compileError, isCompiling }) {
               </span>
             )}
           </div>
+        </div>
+      )}
+
+      {/* Compile-Time Static Memory Violation Cards */}
+      {isFailed && compileError?.staticViolations && compileError.staticViolations.length > 0 && (
+        <div className="space-y-3" data-testid="static-violations-container">
+          <div className="text-[11px] font-semibold text-rose-400 uppercase tracking-wider flex items-center gap-1.5">
+            <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />
+            Statically Proven Heap Violations ({compileError.staticViolations.length})
+          </div>
+          {compileError.staticViolations.map((v, i) => (
+            <div
+              key={i}
+              data-testid="static-violation-card"
+              className="p-3.5 rounded border border-rose-500/50 bg-rose-950/30 text-rose-200 space-y-2.5"
+            >
+              <div className="flex items-center justify-between border-b border-rose-800/60 pb-2">
+                <div className="flex items-center gap-2">
+                  <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span className="font-bold text-xs text-rose-200 uppercase tracking-wide">
+                    Compile-Time Heap Violation: {v.accessType === 'write' ? 'Out-of-Bounds Write' : 'Out-of-Bounds Read'}
+                  </span>
+                </div>
+                <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-rose-900/60 text-rose-300 border border-rose-700">
+                  {v.errorType}
+                </span>
+              </div>
+
+              <p className="text-xs text-rose-200/90 leading-relaxed font-medium">
+                {v.message}
+              </p>
+
+              {/* Memory Information Grid */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 font-mono text-[11px]">
+                <div className="bg-zinc-900/80 p-2 rounded border border-zinc-800">
+                  <span className="text-zinc-500 block text-[10px] uppercase">Location</span>
+                  <span className="text-zinc-200 font-semibold">{v.file}:{v.line}{v.column ? `:${v.column}` : ''}</span>
+                </div>
+                <div className="bg-zinc-900/80 p-2 rounded border border-zinc-800">
+                  <span className="text-zinc-500 block text-[10px] uppercase">Access Type</span>
+                  <span className="text-zinc-200 font-semibold">{v.accessType.toUpperCase()} ({v.accessSize} bytes)</span>
+                </div>
+                <div className="bg-zinc-900/80 p-2 rounded border border-zinc-800">
+                  <span className="text-zinc-500 block text-[10px] uppercase">Offset</span>
+                  <span className="text-rose-400 font-semibold">{v.offset} bytes</span>
+                </div>
+                <div className="bg-zinc-900/80 p-2 rounded border border-zinc-800">
+                  <span className="text-zinc-500 block text-[10px] uppercase">Allocation Size</span>
+                  <span className="text-emerald-400 font-semibold">{v.allocationSize} bytes</span>
+                </div>
+              </div>
+
+              {v.statement && (
+                <div className="mt-1 bg-zinc-950 p-2.5 rounded border border-rose-900/60 font-mono text-xs flex items-center justify-between">
+                  <span className="text-zinc-400 text-[11px]">Offending Statement (Line {v.line}):</span>
+                  <code className="text-rose-300 font-bold bg-rose-950/80 px-2 py-0.5 rounded border border-rose-800 text-xs">
+                    {v.statement}
+                  </code>
+                </div>
+              )}
+            </div>
+          ))}
         </div>
       )}
 

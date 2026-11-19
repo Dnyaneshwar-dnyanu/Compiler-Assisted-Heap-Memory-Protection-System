@@ -28,7 +28,8 @@ int main(void) {
     if (!buf) return 1;
     buf[0] = 10;
     buf[3] = 40; // valid
-    buf[4] = 99; // VIOLATION: index 4 is offset 16 (out-of-bounds for 16-byte alloc)
+    volatile int idx = 4;
+    buf[idx] = 99; // VIOLATION: dynamic index 4 is offset 16 (out-of-bounds for 16-byte alloc)
     free(buf);
     return 0;
 }
@@ -96,7 +97,8 @@ int main(void) {
     char *str = (char *)malloc(10);
     if (!str) return 1;
     for (int i = 0; i < 10; i++) str[i] = 'A' + i;
-    char val = str[15]; // VIOLATION: out-of-bounds read at offset 15
+    volatile int idx = 15;
+    char val = str[idx]; // VIOLATION: dynamic out-of-bounds read at offset 15
     free(str);
     return (int)val;
 }

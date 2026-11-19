@@ -449,8 +449,8 @@ async function runTestFallback({ srcDir, outDir, language, timeoutMs, maxOutputB
   const runtimeLibArg = cfg.useWsl ? toWslPath(cfg.runtimeLibPath) : cfg.runtimeLibPath;
 
   // Stage 1: Frontend compilation
-  const clangArgs = ['-O0', '-Xclang', '-disable-O0-optnone', '-emit-llvm', '-S', sourceArg, '-I', includeArg, '-o', irArg];
-  const s1 = await runTool(compilerTool, clangArgs, { timeoutMs, maxOutputBytes, useWsl: cfg.useWsl });
+  const clangArgs = ['-O0', '-g', '-Xclang', '-disable-O0-optnone', '-emit-llvm', '-S', sourceArg, '-I', includeArg, '-o', irArg];
+  const s1 = await runTool(compilerTool, clangArgs, { timeoutMs, maxOutputBytes, useWsl: cfg.useWsl, cwd: outDir });
   if (!s1.success) {
     const isSpawnOrNotFound = s1.spawnError || s1.exitCode === 127 || /not found|cannot find|No such file/i.test(s1.stderr);
     return {
@@ -470,8 +470,43 @@ async function runTestFallback({ srcDir, outDir, language, timeoutMs, maxOutputB
   await syncDiskFile(irFile);
 
   // Stage 2: MemoryGuard Pass
+  const staticDiagPath = path.join(outDir, 'static_diagnostics.json');
+  const staticDiagArg = cfg.useWsl ? toWslPath(staticDiagPath) : staticDiagPath;
   const optArgs = [`-load-pass-plugin=${pluginArg}`, '-passes=memoryguard', '-S', irArg, '-o', instIrArg];
-  const s2 = await runTool(cfg.optTool, optArgs, { timeoutMs, maxOutputBytes, useWsl: cfg.useWsl });
+  const s2 = await runTool(cfg.optTool, optArgs, {
+    timeoutMs,
+    maxOutputBytes,
+    useWsl: cfg.useWsl,
+    cwd: outDir,
+    env: {
+      MG_STATIC_DIAGNOSTICS_PATH: staticDiagArg,
+      WSLENV: 'MG_STATIC_DIAGNOSTICS_PATH/u'
+    }
+  });
+
+  // Check if static memory violations were detected by the pass
+  if (fs.existsSync(staticDiagPath)) {
+    try {
+      const diags = JSON.parse(fs.readFileSync(staticDiagPath, 'utf8'));
+      if (Array.isArray(diags) && diags.some((d) => d.severity === 'error')) {
+        if (fs.existsSync(outFile)) {
+          fs.rmSync(outFile, { force: true });
+        }
+        return {
+          success: false,
+          exitCode: 4,
+          signal: null,
+          timedOut: false,
+          aborted: false,
+          durationMs: Date.now() - startTime,
+          stdout: s2.stdout,
+          stderr: s2.stderr + '\n=== STAGE_FAILED: STATIC_MEMORY_VIOLATION ===',
+          outputTruncated: s2.outputTruncated
+        };
+      }
+    } catch {}
+  }
+
   if (!s2.success) {
     return {
       success: false,

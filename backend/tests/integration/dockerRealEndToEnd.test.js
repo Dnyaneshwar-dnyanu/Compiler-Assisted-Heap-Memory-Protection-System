@@ -191,7 +191,8 @@ int main(void) {
     int *buf = (int *)malloc(16); // 16 bytes: indices 0..3
     if (!buf) return 1;
     buf[0] = 1;
-    buf[4] = 99; // Out-of-bounds access!
+    volatile int idx = 4;
+    buf[idx] = 99; // Out-of-bounds access!
     free(buf);
     return 0;
 }

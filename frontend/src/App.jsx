@@ -132,7 +132,8 @@ export default function App() {
         code: err.code || 'COMPILATION_ERROR',
         stage: err.stage,
         diagnostics: err.diagnostics || err.message,
-        stages: err.details?.stages || []
+        stages: err.details?.stages || [],
+        staticViolations: err.staticViolations || err.raw?.error?.staticViolations || []
       });
       setActiveTab('diagnostics');
     } finally {
@@ -207,6 +208,7 @@ export default function App() {
               onChange={handleCodeChange}
               language={language}
               readOnly={isCompiling || isRunning}
+              staticViolations={compileError?.staticViolations || []}
             />
           </div>
         </div>
